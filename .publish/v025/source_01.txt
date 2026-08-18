@@ -1,0 +1,464 @@
+  try:
+                versions.append(int(m.group(1)))
+            except ValueError:
+                pass
+
+    # Also consider filenames in the module root.
+    try:
+        for p in folder.iterdir():
+            if not p.is_file():
+                continue
+            for m in re.finditer(r'(?i)\bv(\d{1,5})\b', p.name):
+                try:
+                    versions.append(int(m.group(1)))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+
+    if versions:
+        return f"v{max(versions)}"
+
+    return None
+
+
+
+def latest_error_log() -> Path | None:
+    folder = errors_dir()
+    if not folder.exists():
+        return None
+    logs = [p for p in folder.glob("*.log") if p.is_file()]
+    if not logs:
+        return None
+    return max(logs, key=lambda p: p.stat().st_mtime)
+
+
+
+class ToolTip:
+    """Small hover tooltip for first-time guidance without cluttering the GUI."""
+    def __init__(self, widget, text: str, delay: int = 450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after = None
+        self.tipwindow = None
+
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        self._after = None
+        if self.tipwindow or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+
+        tw = tk.Toplevel(self.widget)
+        self.tipwindow = tw
+        tw.wm_overrideredirect(True)
+        try:
+            tw.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        tw.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            wraplength=440,
+            background="#fff7d6",
+            foreground="#111111",
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
+
+
+def add_tooltip(widget, text: str):
+    ToolTip(widget, text)
+    return widget
+
+
+
+def saved_window_geometry(key: str, default: str | None = None) -> str | None:
+    cfg = load_config()
+    windows = cfg.get("window_geometry", {})
+    value = windows.get(key)
+    return value if isinstance(value, str) and value else default
+
+
+def save_window_geometry(key: str, geometry: str) -> None:
+    if not geometry:
+        return
+    cfg = load_config()
+    windows = cfg.setdefault("window_geometry", {})
+    if windows.get(key) == geometry:
+        return
+    windows[key] = geometry
+    save_config(cfg)
+
+
+def _parse_tk_geometry(geometry: str):
+    m = re.match(r"^\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*$", geometry or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def _windows_find_window_by_title(title_text: str):
+    """Best effort: find a visible top-level Windows window whose title contains text."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        matches = []
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if title_text.lower() in buf.value.lower():
+                matches.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(callback), 0)
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
+
+def _windows_get_rect(hwnd):
+    if os.name != "nt" or not hwnd:
+        return None
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+        rect = RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return (
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            rect.left,
+            rect.top,
+        )
+    except Exception:
+        return None
+
+
+def _windows_move_window(hwnd, geometry: str):
+    parsed = _parse_tk_geometry(geometry)
+    if os.name != "nt" or not hwnd or not parsed:
+        return False
+    try:
+        width, height, x, y = parsed
+        return bool(ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True))
+    except Exception:
+        return False
+
+
+class ScrollFrame(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+
+        self.canvas = tk.Canvas(
+            self,
+            bg="#0c1117",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.scrollbar = ttk.Scrollbar(
+            self, orient="vertical", command=self.canvas.yview
+        )
+        self.inner = ttk.Frame(self.canvas)
+
+        self.window_id = self.canvas.create_window(
+            (0, 0), window=self.inner, anchor="nw"
+        )
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+
+        self.inner.bind("<Configure>", self._sync_scrollregion)
+        self.canvas.bind("<Configure>", self._sync_width)
+
+        self.canvas.bind_all("<MouseWheel>", self._mousewheel)
+
+    def _sync_scrollregion(self, _event=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _sync_width(self, event):
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+
+class ZipBrowser(tk.Toplevel):
+    PREVIEW_LIMIT = 512_000
+
+    def __init__(self, master, zip_path: Path):
+        super().__init__(master)
+        self.zip_path = zip_path
+        self.title(f"ZIP Inspector — {zip_path.name}")
+        self.geometry("980x650")
+        self.minsize(800, 520)
+        self.configure(bg="#0c1117")
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer, text=str(zip_path), style="Subtle.TLabel"
+        ).pack(anchor="w", pady=(0, 10))
+
+        pane = ttk.Panedwindow(outer, orient="horizontal")
+        pane.pack(fill="both", expand=True)
+
+        left = ttk.Frame(pane)
+        right = ttk.Frame(pane)
+        pane.add(left, weight=1)
+        pane.add(right, weight=3)
+
+        self.members = tk.Listbox(
+            left,
+            bg="#121922",
+            fg="#e8eef7",
+            selectbackground="#2e6d9c",
+            selectforeground="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Segoe UI", 10),
+        )
+        self.members.pack(side="left", fill="both", expand=True)
+
+        sb1 = ttk.Scrollbar(left, orient="vertical", command=self.members.yview)
+        sb1.pack(side="right", fill="y")
+        self.members.configure(yscrollcommand=sb1.set)
+        self.members.bind("<<ListboxSelect>>", self._preview_selected)
+
+        self.preview = tk.Text(
+            right,
+            wrap="none",
+            bg="#0f141b",
+            fg="#dce7f3",
+            insertbackground="#ffffff",
+            borderwidth=0,
+            highlightthickness=0,
+            font=("Consolas", 10),
+        )
+        self.preview.pack(side="left", fill="both", expand=True)
+
+        sb2 = ttk.Scrollbar(right, orient="vertical", command=self.preview.yview)
+        sb2.pack(side="right", fill="y")
+        self.preview.configure(yscrollcommand=sb2.set)
+
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for name in zf.namelist():
+                self.members.insert("end", name)
+
+        if self.members.size():
+            self.members.selection_set(0)
+            self._preview_selected()
+
+    def _preview_selected(self, _event=None):
+        selected = self.members.curselection()
+        if not selected:
+            return
+
+        name = self.members.get(selected[0])
+        self.preview.delete("1.0", "end")
+
+        try:
+            with zipfile.ZipFile(self.zip_path, "r") as zf:
+                info = zf.getinfo(name)
+
+                if info.is_dir():
+                    self.preview.insert("1.0", "[Folder]")
+                    return
+
+                suffix = Path(name).suffix.lower()
+                raw = zf.read(name)[:self.PREVIEW_LIMIT]
+
+                if suffix in {
+                    ".txt", ".json", ".csv", ".log", ".md",
+                    ".ini", ".ps1", ".bat", ".py", ".ahk"
+                }:
+                    self.preview.insert(
+                        "1.0", raw.decode("utf-8", errors="replace")
+                    )
+                else:
+                    self.preview.insert(
+                        "1.0",
+                        f"{name}\n\n"
+                        "Read directly from the ZIP — no extraction performed.\n\n"
+                        f"Uncompressed size: {info.file_size:,} bytes\n"
+                        f"Compressed size: {info.compress_size:,} bytes"
+                    )
+        except Exception as exc:
+            self.preview.insert("1.0", f"Could not preview ZIP member:\n{exc}")
+
+
+class MapleToolbox(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title(f"{APP_NAME} v0.25")
+        self.geometry("1220x880")
+        try:
+            if os.name == "nt":
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GuruChoc.MapleToolbox")
+        except Exception:
+            pass
+        try:
+            icon_path = toolbox_dir() / "MapleToolbox.ico"
+            if icon_path.exists():
+                self.iconbitmap(default=str(icon_path))
+        except Exception:
+            pass
+        self.minsize(1080, 720)
+        self.configure(bg="#0c1117")
+
+        cfg = load_config()
+
+        self.root_var = tk.StringVar(
+            value=cfg.get("mapleocr_dir", cfg.get("mapleocr_root", str(DEFAULT_ROOT)))
+        )
+        self.capture_dir_var = tk.StringVar(value=cfg.get("capture_dir", ""))
+        self.mapleocr_dir_var = tk.StringVar(
+            value=cfg.get("mapleocr_dir", cfg.get("mapleocr_root", str(DEFAULT_ROOT)))
+        )
+        self.mapleforge_dir_var = tk.StringVar(value=cfg.get("mapleforge_dir", ""))
+        self.ocr_dir_var = tk.StringVar(value="")
+        self.bismirpg_dir_var = tk.StringVar(value=cfg.get("bismirpg_dir", ""))
+
+        self.status_var = tk.StringVar(value="Ready")
+        self.importer_var = tk.StringVar(value="Not detected")
+        self.bag_count_var = tk.StringVar(value="0")
+        self.equipped_count_var = tk.StringVar(value="0")
+        self.zip_var = tk.StringVar(value="None detected")
+
+        self.capture_installed_var = tk.StringVar(value="Installed: Not detected")
+        self.capture_github_var = tk.StringVar(value="GitHub: not checked")
+        self.capture_update_var = tk.StringVar(value="")
+
+        self.up_to_date_var = tk.StringVar(value="0")
+        self.update_available_var = tk.StringVar(value="0")
+        self.not_installed_var = tk.StringVar(value="0")
+        self.last_checked_var = tk.StringVar(value="Last checked: Never")
+        self.update_details_var = tk.StringVar(value="No update check completed yet.")
+        self.mapleocr_release_var = tk.StringVar(value="Release: not checked")
+        self.mapleforge_release_var = tk.StringVar(value="Release: not checked")
+        self.bismirpg_release_var = tk.StringVar(value="Release: not checked")
+
+        self.prereq_summary_var = tk.StringVar(value="Prerequisites not checked yet.")
+        self.directory_health_var = tk.StringVar(value="Directory health not checked yet.")
+
+        self._configure_styles()
+        self._build_ui()
+        self.refresh_status()
+        self.after(150, self._apply_button_tooltips)
+
+        if not config_exists():
+            self.after(250, self.show_first_run_wizard)
+
+    def _configure_styles(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(".", font=("Segoe UI", 10))
+        style.configure("TFrame", background="#0c1117")
+        style.configure("Card.TFrame", background="#151d27")
+        style.configure("TLabel", background="#0c1117", foreground="#e8eef7")
+        style.configure("Card.TLabel", background="#151d27", foreground="#e8eef7")
+        style.configure("Title.TLabel", background="#0c1117", foreground="#ffffff",
+                        font=("Segoe UI Semibold", 24))
+        style.configure("Tagline.TLabel", background="#0c1117", foreground="#b7c7d9",
+                        font=("Segoe UI", 11, "italic"))
+        style.configure("Section.TLabel", background="#151d27", foreground="#ffffff",
+                        font=("Segoe UI Semibold", 14))
+        style.configure("Subtle.TLabel", background="#0c1117", foreground="#93a4b7")
+        style.configure("CardSubtle.TLabel", background="#151d27", foreground="#93a4b7")
+        style.configure("Good.TLabel", background="#151d27", foreground="#61d98a",
+                        font=("Segoe UI Semibold", 11))
+        style.configure("Warn.TLabel", background="#151d27", foreground="#e1ad3d",
+                        font=("Segoe UI Semibold", 11))
+        style.configure("Teaser.TLabel", background="#151d27", foreground="#f0b83f",
+                        font=("Segoe UI Semibold", 10))
+        style.configure("Metric.TLabel", background="#151d27", foreground="#61d98a",
+                        font=("Segoe UI Semibold", 16))
+        style.configure("TButton", padding=(12, 9), background="#233244",
+                        foreground="#ffffff", borderwidth=0)
+        style.map("TButton",
+                  background=[("active", "#31475f"), ("disabled", "#1a222c")],
+                  foreground=[("disabled", "#657384")])
+        style.configure("Accent.TButton", background="#2e6d9c", foreground="#ffffff")
+        style.map("Accent.TButton", background=[("active", "#3b82b5")])
+        style.configure("Green.TButton", background="#26753c", foreground="#ffffff")
+        style.map("Green.TButton", background=[("active", "#32944d")])
+        style.configure("Danger.TButton", background="#713e46", foreground="#ffffff")
+        style.map("Danger.TButton", background=[("active", "#92505b")])
+        style.configure("TEntry", fieldbackground="#0f141b", foreground="#e8eef7",
+                        insertcolor="#ffffff")
+
+        style.configure(
+            "Cylon.Horizontal.TProgressbar",
+            troughcolor="#0f141b",
+            background="#d71920",
+            lightcolor="#ff3038",
+            darkcolor="#a90f15",
+            bordercolor="#0f141b",
+        )
+
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(22, 16, 22, 10))
+        header.pack(fill="x")
+
+        title_box = ttk.Frame(header)
+        title_box.pack(side="left")
+        ttk.Label(title_box, text="Maple Toolbox", sty
