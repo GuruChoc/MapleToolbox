@@ -1,0 +1,48 @@
+name: Publish Maple Toolbox v0.25
+
+on:
+  push:
+    paths:
+      - ".github/workflows/publish-v025.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild and validate plain source
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, zlib
+          root = Path('.publish/v025')
+          parts = sorted(root.glob('src8_*.txt'))
+          if len(parts) != 5:
+              raise SystemExit(f'Expected 5 source chunks, found {len(parts)}')
+          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in parts)
+          source = zlib.decompress(base64.b64decode(encoded))
+          Path('MapleToolbox.py').write_bytes(source)
+          print(f'Rebuilt MapleToolbox.py: {len(source)} bytes')
+          PY
+          python -m py_compile MapleToolbox.py
+
+      - name: Remove one-time staging files
+        shell: bash
+        run: |
+          rm -rf .publish
+          rm -f .github/workflows/publish-v025.yml
+
+      - name: Commit v0.25
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Publish Maple Toolbox v0.25"
+          git push
