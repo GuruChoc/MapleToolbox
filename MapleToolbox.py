@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import ctypes
 import os
 import platform
 import re
 import shutil
 import subprocess
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +21,8 @@ from tkinter import ttk, filedialog, messagebox
 
 
 APP_NAME = "Maple Toolbox"
-APP_VERSION = "v0.23"
+APP_VERSION = "v0.25"
+VISIBLE_CONSOLE_COUNTDOWN_SECONDS = 8  # Successful visible console runs count down before closing.
 FEEDBACK_EMAIL = "maple@arcadeheaven.com"
 TAGLINE = "One Toolbox to run them all."
 DEFAULT_ROOT = Path(r"C:\MapleOCR")
@@ -568,6 +571,170 @@ def latest_error_log() -> Path | None:
     return max(logs, key=lambda p: p.stat().st_mtime)
 
 
+
+class ToolTip:
+    """Small hover tooltip for first-time guidance without cluttering the GUI."""
+    def __init__(self, widget, text: str, delay: int = 450):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self._after = None
+        self.tipwindow = None
+
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after is not None:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        self._after = None
+        if self.tipwindow or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 18
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        except Exception:
+            return
+
+        tw = tk.Toplevel(self.widget)
+        self.tipwindow = tw
+        tw.wm_overrideredirect(True)
+        try:
+            tw.wm_attributes("-topmost", True)
+        except Exception:
+            pass
+        tw.wm_geometry(f"+{x}+{y}")
+
+        label = tk.Label(
+            tw,
+            text=self.text,
+            justify="left",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            wraplength=440,
+            background="#fff7d6",
+            foreground="#111111",
+            font=("Segoe UI", 9),
+        )
+        label.pack()
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self.tipwindow is not None:
+            try:
+                self.tipwindow.destroy()
+            except Exception:
+                pass
+            self.tipwindow = None
+
+
+def add_tooltip(widget, text: str):
+    ToolTip(widget, text)
+    return widget
+
+
+
+def saved_window_geometry(key: str, default: str | None = None) -> str | None:
+    cfg = load_config()
+    windows = cfg.get("window_geometry", {})
+    value = windows.get(key)
+    return value if isinstance(value, str) and value else default
+
+
+def save_window_geometry(key: str, geometry: str) -> None:
+    if not geometry:
+        return
+    cfg = load_config()
+    windows = cfg.setdefault("window_geometry", {})
+    if windows.get(key) == geometry:
+        return
+    windows[key] = geometry
+    save_config(cfg)
+
+
+def _parse_tk_geometry(geometry: str):
+    m = re.match(r"^\s*(\d+)x(\d+)([+-]\d+)([+-]\d+)\s*$", geometry or "")
+    if not m:
+        return None
+    return tuple(int(x) for x in m.groups())
+
+
+def _windows_find_window_by_title(title_text: str):
+    """Best effort: find a visible top-level Windows window whose title contains text."""
+    if os.name != "nt":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        matches = []
+
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+        def callback(hwnd, _lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            if title_text.lower() in buf.value.lower():
+                matches.append(hwnd)
+            return True
+
+        user32.EnumWindows(EnumWindowsProc(callback), 0)
+        return matches[0] if matches else None
+    except Exception:
+        return None
+
+
+def _windows_get_rect(hwnd):
+    if os.name != "nt" or not hwnd:
+        return None
+    try:
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", ctypes.c_long),
+                ("top", ctypes.c_long),
+                ("right", ctypes.c_long),
+                ("bottom", ctypes.c_long),
+            ]
+        rect = RECT()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return (
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            rect.left,
+            rect.top,
+        )
+    except Exception:
+        return None
+
+
+def _windows_move_window(hwnd, geometry: str):
+    parsed = _parse_tk_geometry(geometry)
+    if os.name != "nt" or not hwnd or not parsed:
+        return False
+    try:
+        width, height, x, y = parsed
+        return bool(ctypes.windll.user32.MoveWindow(hwnd, x, y, width, height, True))
+    except Exception:
+        return False
+
+
 class ScrollFrame(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -715,8 +882,19 @@ class MapleToolbox(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title(f"{APP_NAME} v0.23")
+        self.title(f"{APP_NAME} v0.25")
         self.geometry("1220x880")
+        try:
+            if os.name == "nt":
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("GuruChoc.MapleToolbox")
+        except Exception:
+            pass
+        try:
+            icon_path = toolbox_dir() / "MapleToolbox.ico"
+            if icon_path.exists():
+                self.iconbitmap(default=str(icon_path))
+        except Exception:
+            pass
         self.minsize(1080, 720)
         self.configure(bg="#0c1117")
 
@@ -758,6 +936,7 @@ class MapleToolbox(tk.Tk):
         self._configure_styles()
         self._build_ui()
         self.refresh_status()
+        self.after(150, self._apply_button_tooltips)
 
         if not config_exists():
             self.after(250, self.show_first_run_wizard)
@@ -852,7 +1031,7 @@ class MapleToolbox(tk.Tk):
         footer = ttk.Frame(self, padding=(22, 10, 22, 14))
         footer.pack(fill="x")
         ttk.Label(footer, textvariable=self.status_var, style="Subtle.TLabel").pack(side="left")
-        ttk.Label(footer, text="Maple Toolbox v0.23", style="Subtle.TLabel").pack(side="left", padx=(40, 0))
+        ttk.Label(footer, text=f"Maple Toolbox {APP_VERSION}", style="Subtle.TLabel").pack(side="left", padx=(40, 0))
         ttk.Button(footer, text="Open Toolbox Folder", command=self.open_toolbox_folder).pack(side="right", padx=(8, 0))
         ttk.Button(footer, text="Exit", style="Danger.TButton", command=self.destroy).pack(side="right")
 
@@ -960,6 +1139,7 @@ class MapleToolbox(tk.Tk):
     def _build_prerequisites(self, parent):
         card = self.card(parent)
         self._configure_four_columns(card)
+        self.prereq_card = card
 
         row = self._section_header(
             card,
@@ -967,30 +1147,54 @@ class MapleToolbox(tk.Tk):
             "Checks prerequisites visibly. Nothing is installed or changed without your approval."
         )
 
+        self.prereq_actions = ttk.Frame(card, style="Card.TFrame")
+        self.prereq_actions.grid(
+            row=row, column=0, columnspan=4, sticky="ew"
+        )
+        self._configure_four_columns(self.prereq_actions)
+
         ttk.Button(
-            card,
+            self.prereq_actions,
             text="Check Requirements",
             style="Accent.TButton",
             command=self.check_prerequisites,
-        ).grid(row=row, column=0, sticky="ew", padx=(0, 6))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ttk.Button(
-            card,
+            self.prereq_actions,
             text="Install Missing Requirements",
             command=self.install_missing_requirements,
-        ).grid(row=row, column=1, sticky="ew", padx=6)
+        ).grid(row=0, column=1, sticky="ew", padx=6)
 
         ttk.Button(
-            card,
+            self.prereq_actions,
             text="Re-check",
             command=self.check_prerequisites,
-        ).grid(row=row, column=2, sticky="ew", padx=6)
+        ).grid(row=0, column=2, sticky="ew", padx=6)
 
         ttk.Button(
-            card,
+            self.prereq_actions,
             text="Open Windows Terminal",
             command=self.open_visible_terminal,
-        ).grid(row=row, column=3, sticky="ew", padx=(6, 0))
+        ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        self.prereq_summary_frame = ttk.Frame(card, style="Card.TFrame")
+        self.prereq_summary_frame.grid(
+            row=row, column=0, columnspan=4, sticky="ew"
+        )
+        self.prereq_summary_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            self.prereq_summary_frame,
+            text="✓ System Requirements — All OK",
+            style="Good.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.prereq_toggle_button = ttk.Button(
+            self.prereq_summary_frame,
+            text="Show Details",
+            command=self.toggle_prerequisite_details,
+        )
+        self.prereq_toggle_button.grid(row=0, column=1, sticky="e")
+        self.prereq_summary_frame.grid_remove()
 
         self.prereq_frame = ttk.Frame(card, style="Card.TFrame")
         self.prereq_frame.grid(
@@ -1012,6 +1216,7 @@ class MapleToolbox(tk.Tk):
     def _build_directory_health(self, parent):
         card = self.card(parent)
         self._configure_four_columns(card)
+        self.directory_health_card = card
 
         row = self._section_header(
             card,
@@ -1019,30 +1224,54 @@ class MapleToolbox(tk.Tk):
             "Checks configured folders and can create only safe missing folders."
         )
 
+        self.directory_health_actions = ttk.Frame(card, style="Card.TFrame")
+        self.directory_health_actions.grid(
+            row=row, column=0, columnspan=4, sticky="ew"
+        )
+        self._configure_four_columns(self.directory_health_actions)
+
         ttk.Button(
-            card,
+            self.directory_health_actions,
             text="Check Directories",
             style="Accent.TButton",
             command=self.check_directory_health,
-        ).grid(row=row, column=0, sticky="ew", padx=(0, 6))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
         ttk.Button(
-            card,
+            self.directory_health_actions,
             text="Create Safe Missing Folders",
             command=self.create_safe_missing_folders,
-        ).grid(row=row, column=1, sticky="ew", padx=6)
+        ).grid(row=0, column=1, sticky="ew", padx=6)
 
         ttk.Button(
-            card,
+            self.directory_health_actions,
             text="Open Errors Folder",
             command=self.open_errors_folder,
-        ).grid(row=row, column=2, sticky="ew", padx=6)
+        ).grid(row=0, column=2, sticky="ew", padx=6)
 
         ttk.Button(
-            card,
+            self.directory_health_actions,
             text="Re-check",
             command=self.check_directory_health,
-        ).grid(row=row, column=3, sticky="ew", padx=(6, 0))
+        ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        self.directory_health_summary_frame = ttk.Frame(card, style="Card.TFrame")
+        self.directory_health_summary_frame.grid(
+            row=row, column=0, columnspan=4, sticky="ew"
+        )
+        self.directory_health_summary_frame.columnconfigure(0, weight=1)
+        ttk.Label(
+            self.directory_health_summary_frame,
+            text="✓ Directory Health — All OK",
+            style="Good.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.directory_health_toggle_button = ttk.Button(
+            self.directory_health_summary_frame,
+            text="Show Details",
+            command=self.toggle_directory_health_details,
+        )
+        self.directory_health_toggle_button.grid(row=0, column=1, sticky="e")
+        self.directory_health_summary_frame.grid_remove()
 
         self.directory_health_frame = ttk.Frame(card, style="Card.TFrame")
         self.directory_health_frame.grid(
@@ -1215,24 +1444,60 @@ class MapleToolbox(tk.Tk):
         )
 
     def _build_future_modules(self, parent):
+        self._build_bismirpg(parent)
         self._release_module_card(
             parent,
-            "7. MapleForge",
+            "8. MapleForge",
             None,
             self.mapleforge_dir_var,
             "mapleforge",
             self.mapleforge_release_var,
             coming_soon=True,
         )
-        self._release_module_card(
-            parent,
-            "8. BISMIRPG",
-            "BIS report / Lock-Unlock report module",
-            self.bismirpg_dir_var,
-            "bismirpg",
-            self.bismirpg_release_var,
-            coming_soon=True,
+
+    def _build_bismirpg(self, parent):
+        card = self.card(parent)
+        self._configure_four_columns(card)
+
+        row = self._section_header(
+            card,
+            "7. BISMIRPG",
+            "BIS report / Lock-Unlock report module — fresh optimiser export required before BIS report.",
         )
+        row = self._operating_folder_row(
+            card,
+            row,
+            self.bismirpg_dir_var,
+            lambda: self.select_module_folder("bismirpg"),
+            lambda: self.open_module_folder("bismirpg"),
+        )
+
+        ttk.Label(
+            card, textvariable=self.bismirpg_release_var, style="Good.TLabel"
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 10))
+        ttk.Label(
+            card, text="REPORT GENERATOR ACTIVE", style="Good.TLabel"
+        ).grid(row=row, column=2, columnspan=2, sticky="e", pady=(12, 10))
+        row += 1
+
+        ttk.Button(
+            card, text="Generate BIS Report", style="Accent.TButton",
+            command=self.run_bismirpg_report,
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6))
+        ttk.Button(
+            card, text="Open BIS Reports",
+            command=self.open_bismirpg_reports,
+        ).grid(row=row, column=2, columnspan=2, sticky="ew", padx=(6, 0))
+        row += 1
+
+        ttk.Button(
+            card, text="GitHub Repository",
+            command=lambda: self.open_module_github("bismirpg"),
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Button(
+            card, text="Get Release / Update",
+            command=lambda: self.open_module_release("bismirpg"),
+        ).grid(row=row, column=2, columnspan=2, sticky="ew", padx=(6, 0), pady=(8, 0))
 
     def _release_module_card(
         self,
@@ -1295,6 +1560,370 @@ class MapleToolbox(tk.Tk):
             row=row, column=2, columnspan=2,
             sticky="ew", padx=(6, 0)
         )
+
+    def _bismirpg_reports_dir(self) -> Path:
+        folder = self.module_folder("bismirpg")
+        if not folder:
+            raise FileNotFoundError("BISMIRPG Operating Folder is not set.")
+        return folder / "Reports"
+
+    def open_bismirpg_reports(self):
+        try:
+            reports = self._bismirpg_reports_dir()
+            reports.mkdir(parents=True, exist_ok=True)
+            open_path(reports)
+        except Exception as exc:
+            messagebox.showerror("Could not open BIS Reports", str(exc))
+
+    def run_bismirpg_report(self):
+        bis_folder = self.module_folder("bismirpg")
+        if not bis_folder or not bis_folder.exists():
+            messagebox.showwarning(
+                "BISMIRPG not installed",
+                "Select or install the BISMIRPG Operating Folder first."
+            )
+            return
+
+        generator = bis_folder / "bis_report_generator.py"
+        if not generator.exists():
+            messagebox.showwarning(
+                "BISMIRPG generator not found",
+                f"Could not find:\n{generator}\n\nUse Get Release / Update first."
+            )
+            return
+
+        source_zip = self.root_path() / "BIS_stats.zip"
+        if not source_zip.exists():
+            chosen = filedialog.askopenfilename(
+                title="Choose BIS_stats.zip",
+                filetypes=[("BIS stats ZIP", "*.zip"), ("All files", "*.*")],
+            )
+            if not chosen:
+                return
+            source_zip = Path(chosen)
+
+        reports = bis_folder / "Reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        work = bis_folder / ".toolbox_bis_work"
+        if work.exists():
+            shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(source_zip, "r") as zf:
+                zf.extractall(work)
+        except Exception as exc:
+            messagebox.showerror("Could not read BIS_stats.zip", str(exc))
+            return
+
+        def find_one(name):
+            hits = list(work.rglob(name))
+            return hits[0] if hits else None
+
+        export = find_one("mapleexport.txt")
+        status = find_one("lock_status.txt")
+        csv_hits = sorted(work.rglob("import_review_easyocr_v*.csv"))
+        review_csv = csv_hits[-1] if csv_hits else None
+
+        missing = []
+        if not export: missing.append("mapleexport.txt")
+        if not status: missing.append("lock_status.txt")
+        if not review_csv: missing.append("import_review_easyocr_vXXX.csv")
+        if missing:
+            messagebox.showerror(
+                "BIS_stats.zip is incomplete",
+                "Missing required file(s):\n\n" + "\n".join(missing)
+            )
+            return
+
+        # Validate that the optimiser export and OCR lock snapshot belong to the
+        # same current equipment state before the BIS generator is allowed to run.
+        # This catches stale mapleexport.txt files early, with a useful message,
+        # instead of letting the report crash later on a missing equipment ID.
+        try:
+            export_data = json.loads(export.read_text(encoding="utf-8"))
+            export_item_ids = set()
+
+            for arr in export_data.get("comparisonItemsBySlot", {}).values():
+                for item in arr or []:
+                    if isinstance(item, dict) and item.get("id") is not None:
+                        export_item_ids.add(int(item["id"]))
+
+            for item in export_data.get("equippedItemsBySlot", {}).values():
+                if isinstance(item, dict) and item.get("id") is not None:
+                    export_item_ids.add(int(item["id"]))
+
+            lock_ids = set()
+            for line in status.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith(("locked|", "unlocked|")):
+                    parts = line.split("|", 6)
+                    if len(parts) >= 3:
+                        try:
+                            lock_ids.add(int(parts[2]))
+                        except ValueError:
+                            pass
+
+            # Preset IDs are the critical failure mode: the report must be able
+            # to resolve every non-empty preset item against the current export.
+            preset_ids = set()
+            preset_refs = []
+            preset_names = export_data.get("equipmentPresetNames", [])
+            for idx, preset in enumerate(export_data.get("equipmentPresets", [])):
+                if not isinstance(preset, dict):
+                    continue
+                pname = (
+                    str(preset_names[idx])
+                    if idx < len(preset_names)
+                    else f"Preset {idx + 1}"
+                )
+                for slot, iid in preset.items():
+                    if iid in (None, "", 0):
+                        continue
+                    try:
+                        iid_int = int(iid)
+                    except (TypeError, ValueError):
+                        continue
+                    preset_ids.add(iid_int)
+                    preset_refs.append((iid_int, pname, str(slot)))
+
+            # OCR Equipped rows are authoritative for Basic, so those IDs must
+            # also exist in the fresh optimiser export. Otherwise the report will
+            # replace Basic with an ID it cannot resolve and later crash.
+            equipped_ids = set()
+            equipped_refs = []
+            for line in status.read_text(encoding="utf-8", errors="replace").splitlines():
+                if not line.startswith(("locked|", "unlocked|")):
+                    continue
+                parts = line.split("|", 6)
+                if len(parts) < 6:
+                    continue
+                try:
+                    iid = int(parts[2])
+                except ValueError:
+                    continue
+                slot = parts[1]
+                source_name = parts[4].strip().lower()
+                if source_name == "equipped":
+                    equipped_ids.add(iid)
+                    equipped_refs.append((iid, slot))
+
+            unresolved_presets = sorted(preset_ids - export_item_ids)
+            unresolved_equipped = sorted(equipped_ids - export_item_ids)
+
+            if unresolved_presets or unresolved_equipped:
+                details = []
+
+                for iid in unresolved_equipped[:12]:
+                    slots = [slot for ref_id, slot in equipped_refs if ref_id == iid]
+                    slot_text = ", ".join(slots[:3]) if slots else "Basic / Equipped"
+                    details.append(f"ID {iid}: OCR Equipped / {slot_text}")
+
+                remaining = max(0, 12 - len(details))
+                for iid in unresolved_presets[:remaining]:
+                    refs = [
+                        f"{pname} / {slot}"
+                        for ref_id, pname, slot in preset_refs
+                        if ref_id == iid
+                    ]
+                    ref_text = ", ".join(refs[:3]) if refs else "preset reference"
+                    details.append(f"ID {iid}: {ref_text}")
+
+                total_bad = len(set(unresolved_presets) | set(unresolved_equipped))
+                extra = ""
+                if total_bad > len(details):
+                    extra = f"\n...and {total_bad - len(details)} more."
+
+                raise RuntimeError(
+                    "The optimiser export is not valid for this BIS run.\n\n"
+                    "BISMIRPG found equipment IDs required by the current OCR/optimiser "
+                    "state that are missing from mapleexport.txt:\n\n"
+                    + "\n".join(details)
+                    + extra
+                    + "\n\nThis means the OCR scan and optimiser export are not from "
+                    "the same equipment state.\n\n"
+                    "Correct workflow:\n"
+                    "1. Run the current OCR scan.\n"
+                    "2. Import the new mapleupload.txt into the optimiser.\n"
+                    "3. Export a fresh mapleexport.txt back to MapleOCR.\n"
+                    "4. Rebuild/refresh BIS_stats.zip.\n"
+                    "5. Run BISMIRPG again."
+                )
+
+        except Exception as exc:
+            messagebox.showerror(
+                "BIS handoff validation failed",
+                str(exc)
+            )
+            return
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_out = reports / f"MapleStory_BIS_Report_{stamp}.pdf"
+        txt_out = reports / f"MapleStory_BIS_Lock_Unlock_{stamp}.txt"
+        runner = work / "toolbox_bis_generator.py"
+
+        try:
+            source = generator.read_text(encoding="utf-8", errors="strict")
+            replacements = {
+                r"^EXP=.*$": f"EXP={str(export)!r}",
+                r"^STATUS=.*$": f"STATUS={str(status)!r}",
+                r"^CSV=.*$": f"CSV={str(review_csv)!r}",
+                r"^OUT=.*$": f"OUT={str(pdf_out)!r}",
+                r"^TXT=.*$": f"TXT={str(txt_out)!r}",
+            }
+            for pattern, value in replacements.items():
+                source, count = re.subn(
+                    pattern,
+                    lambda _m, replacement=value: replacement,
+                    source,
+                    count=1,
+                    flags=re.M,
+                )
+                if count != 1:
+                    raise RuntimeError(f"Could not configure generator setting: {pattern}")
+            runner.write_text(source, encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("Could not prepare BIS generator", str(exc))
+            return
+
+        python_exe = self.root_path() / ".venv" / "Scripts" / "python.exe"
+        if not python_exe.exists():
+            python_hit = shutil.which("python.exe") or shutil.which("python")
+            if not python_hit:
+                messagebox.showerror(
+                    "Python not found",
+                    "BISMIRPG needs Python. Run System Requirements first."
+                )
+                return
+            python_exe = Path(python_hit)
+
+        # Keep execution loud/visible, consistent with the rest of Toolbox.
+        # Use a real .cmd file instead of passing a long quoted command through
+        # `cmd.exe /k`.  The latter can turn the quoted Python path into a
+        # literal command string on some Windows setups.
+        launch_cmd = work / "run_bismirpg_from_toolbox.cmd"
+
+        def cmd_escape(value: Path) -> str:
+            # Batch SET syntax safely preserves spaces and most punctuation.
+            return str(value).replace("%", "%%")
+
+        batch = f"""@echo off
+title Maple Toolbox - BISMIRPG report generator
+echo Maple Toolbox - BISMIRPG report generator
+echo.
+
+set "PY={cmd_escape(python_exe)}"
+set "RUNNER={cmd_escape(runner)}"
+set "REPORTS={cmd_escape(reports)}"
+set "SHELLLOG={cmd_escape(work / "last_bismirpg_shell_output.txt")}"
+
+> "%SHELLLOG%" echo Maple Toolbox - BISMIRPG report generator
+>>"%SHELLLOG%" echo.
+
+echo Checking BISMIRPG requirements...
+>>"%SHELLLOG%" echo Checking BISMIRPG requirements...
+"%PY%" -c "import reportlab" >nul 2>&1
+if errorlevel 1 (
+    echo reportlab is missing.
+    >>"%SHELLLOG%" echo reportlab is missing.
+    echo Installing reportlab visibly...
+    >>"%SHELLLOG%" echo Installing reportlab visibly...
+    powershell.exe -NoProfile -Command "& '%PY%' -m pip install reportlab 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+    if errorlevel 1 goto :failed
+)
+
+echo.
+echo Generating BIS report...
+>>"%SHELLLOG%" echo.
+>>"%SHELLLOG%" echo Generating BIS report...
+powershell.exe -NoProfile -Command "& '%PY%' '%RUNNER%' 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+if errorlevel 1 goto :failed
+
+echo.
+echo BISMIRPG complete.
+echo Reports folder: %REPORTS%
+>>"%SHELLLOG%" echo.
+>>"%SHELLLOG%" echo BISMIRPG complete.
+>>"%SHELLLOG%" echo Reports folder: %REPORTS%
+type "%SHELLLOG%" | clip
+echo.
+echo Output copied to clipboard.
+start "" "%REPORTS%"
+echo.
+echo This window will close automatically.
+for /l %%S in (8,-1,1) do (
+    echo Closing in %%S...
+    timeout /t 1 /nobreak >nul
+)
+echo Closing now.
+exit /b 0
+
+:failed
+echo.
+echo BISMIRPG FAILED. This window will stay open.
+>>"%SHELLLOG%" echo.
+>>"%SHELLLOG%" echo BISMIRPG FAILED.
+type "%SHELLLOG%" | clip
+echo Output copied to clipboard.
+echo.
+pause
+"""
+        try:
+            launch_cmd.write_text(batch, encoding="utf-8")
+            subprocess.Popen(
+                ["cmd.exe", "/k", str(launch_cmd)],
+                cwd=str(bis_folder),
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+            self._restore_and_track_console_window(
+                "Maple Toolbox - BISMIRPG report generator",
+                "shell_window",
+            )
+            self.status_var.set("BISMIRPG report generator opened")
+        except Exception as exc:
+            messagebox.showerror("Could not start BISMIRPG", str(exc))
+
+    def _restore_and_track_console_window(self, title_text: str, key: str):
+        """Restore a Toolbox-owned shell window and remember where the user moves it."""
+        if os.name != "nt":
+            return
+
+        def worker():
+            hwnd = None
+            # Console creation can take a moment.
+            for _ in range(60):
+                hwnd = _windows_find_window_by_title(title_text)
+                if hwnd:
+                    break
+                time.sleep(0.1)
+
+            if not hwnd:
+                return
+
+            saved = saved_window_geometry(key)
+            if saved:
+                _windows_move_window(hwnd, saved)
+
+            last_geometry = None
+            # Keep sampling while the shell exists. This records manual moves/resizes.
+            while True:
+                try:
+                    if not ctypes.windll.user32.IsWindow(hwnd):
+                        break
+                except Exception:
+                    break
+
+                rect = _windows_get_rect(hwnd)
+                if rect:
+                    width, height, x, y = rect
+                    geometry = f"{width}x{height}{x:+d}{y:+d}"
+                    if geometry != last_geometry:
+                        last_geometry = geometry
+                time.sleep(0.5)
+
+            if last_geometry:
+                save_window_geometry(key, last_geometry)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def prerequisite_status(self):
         checks = []
@@ -1418,6 +2047,54 @@ class MapleToolbox(tk.Tk):
 
         return checks
 
+    def _set_prerequisite_collapsed(self, collapsed: bool):
+        try:
+            if collapsed:
+                self.prereq_actions.grid_remove()
+                self.prereq_frame.grid_remove()
+                self.prereq_summary_frame.grid()
+                self.prereq_toggle_button.configure(text="Show Details")
+            else:
+                self.prereq_summary_frame.grid_remove()
+                self.prereq_actions.grid()
+                self.prereq_frame.grid()
+                self.prereq_toggle_button.configure(text="Hide Details")
+        except (AttributeError, tk.TclError):
+            pass
+
+    def toggle_prerequisite_details(self):
+        try:
+            if self.prereq_summary_frame.winfo_ismapped():
+                self._set_prerequisite_collapsed(False)
+            else:
+                self._set_prerequisite_collapsed(True)
+        except tk.TclError:
+            pass
+
+    def _set_directory_health_collapsed(self, collapsed: bool):
+        try:
+            if collapsed:
+                self.directory_health_actions.grid_remove()
+                self.directory_health_frame.grid_remove()
+                self.directory_health_summary_frame.grid()
+                self.directory_health_toggle_button.configure(text="Show Details")
+            else:
+                self.directory_health_summary_frame.grid_remove()
+                self.directory_health_actions.grid()
+                self.directory_health_frame.grid()
+                self.directory_health_toggle_button.configure(text="Hide Details")
+        except (AttributeError, tk.TclError):
+            pass
+
+    def toggle_directory_health_details(self):
+        try:
+            if self.directory_health_summary_frame.winfo_ismapped():
+                self._set_directory_health_collapsed(False)
+            else:
+                self._set_directory_health_collapsed(True)
+        except tk.TclError:
+            pass
+
     def _render_prerequisites(self, checks):
         for child in self.prereq_frame.winfo_children():
             child.destroy()
@@ -1443,10 +2120,12 @@ class MapleToolbox(tk.Tk):
         missing = [c for c in checks if not c["ok"]]
         if not missing:
             self.prereq_summary_var.set("All checked requirements are present.")
+            self._set_prerequisite_collapsed(True)
         else:
             self.prereq_summary_var.set(
                 f"{len(missing)} requirement(s) need attention."
             )
+            self._set_prerequisite_collapsed(False)
 
     def check_prerequisites(self):
         checks = self.prerequisite_status()
@@ -1542,11 +2221,15 @@ class MapleToolbox(tk.Tk):
 
             ids = " ".join(c["winget_id"] for c in requested)
 
+            shell_log = str((Path(os.environ.get("TEMP", str(Path.home()))) / "MapleToolbox_last_shell_output.txt")).replace("%", "%%")
             cmd_lines = [
+                'title Maple Toolbox - Prerequisite Installer',
+                f'set "SHELLLOG={shell_log}"',
+                '> "%SHELLLOG%" echo Maple Toolbox prerequisite installer',
                 'echo Maple Toolbox prerequisite installer',
                 'echo.',
                 'echo Refreshing winget package sources...',
-                'winget source update',
+                'powershell.exe -NoProfile -Command "winget source update 2>&1 | Tee-Object -FilePath \'%SHELLLOG%\' -Append; exit $LASTEXITCODE"',
                 'echo.',
             ]
 
@@ -1555,15 +2238,22 @@ class MapleToolbox(tk.Tk):
                 label = c["label"]
                 cmd_lines.extend([
                     f'echo Checking {label}...',
-                    f'winget search --id "{pkg}" --exact',
-                    f'if errorlevel 1 (echo PACKAGE NOT FOUND: {pkg}) else (winget install --id "{pkg}" --exact)',
+                    f'powershell.exe -NoProfile -Command "winget search --id \'{pkg}\' --exact 2>&1 | Tee-Object -FilePath \'%SHELLLOG%\' -Append; exit $LASTEXITCODE"',
+                    f'if errorlevel 1 (echo PACKAGE NOT FOUND: {pkg} & echo PACKAGE NOT FOUND: {pkg}>>"%SHELLLOG%") else (powershell.exe -NoProfile -Command "winget install --id \'{pkg}\' --exact 2>&1 | Tee-Object -FilePath \'%SHELLLOG%\' -Append; exit $LASTEXITCODE")',
                     'echo.',
                 ])
 
             cmd_lines.extend([
                 'echo Install process finished.',
                 'echo Return to Maple Toolbox and click Re-check.',
-                'pause'
+                'echo Return to Maple Toolbox and click Re-check.>>"%SHELLLOG%"',
+                'type "%SHELLLOG%" | clip',
+                'echo.',
+                'echo Output copied to clipboard.',
+                'echo This window will close automatically.',
+                'for /l %S in (8,-1,1) do @echo Closing in %S... & timeout /t 1 /nobreak >nul',
+                'echo Closing now.',
+                'exit'
             ])
             final = " & ".join(cmd_lines)
 
@@ -1579,19 +2269,33 @@ class MapleToolbox(tk.Tk):
             if not approved:
                 return
 
-            cmd_lines = ['echo Maple Toolbox prerequisite installer', 'echo.']
+            shell_log = str((Path(os.environ.get("TEMP", str(Path.home()))) / "MapleToolbox_last_shell_output.txt")).replace("%", "%%")
+            cmd_lines = [
+                'title Maple Toolbox - Prerequisite Installer',
+                f'set "SHELLLOG={shell_log}"',
+                '> "%SHELLLOG%" echo Maple Toolbox prerequisite installer',
+                'echo Maple Toolbox prerequisite installer',
+                'echo.',
+            ]
             for c in visible:
                 pkg = c["winget_id"]
                 label = c["label"]
                 cmd_lines.extend([
                     f'echo Installing {label}...',
-                    f'winget install --id "{pkg}" --exact',
+                    f'powershell.exe -NoProfile -Command "winget install --id \'{pkg}\' --exact 2>&1 | Tee-Object -FilePath \'%SHELLLOG%\' -Append; exit $LASTEXITCODE"',
                     'echo.',
                 ])
             cmd_lines.extend([
                 'echo Install process finished.',
                 'echo Return to Maple Toolbox and click Re-check.',
-                'pause'
+                'echo Return to Maple Toolbox and click Re-check.>>"%SHELLLOG%"',
+                'type "%SHELLLOG%" | clip',
+                'echo.',
+                'echo Output copied to clipboard.',
+                'echo This window will close automatically.',
+                'for /l %S in (8,-1,1) do @echo Closing in %S... & timeout /t 1 /nobreak >nul',
+                'echo Closing now.',
+                'exit'
             ])
             final = " & ".join(cmd_lines)
 
@@ -1600,6 +2304,10 @@ class MapleToolbox(tk.Tk):
                 ["cmd.exe", "/k", final],
                 cwd=str(Path.home()),
                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+            self._restore_and_track_console_window(
+                "Maple Toolbox - Prerequisite Installer",
+                "shell_window",
             )
             self.status_var.set("Visible prerequisite installer opened")
         except Exception as exc:
@@ -1671,8 +2379,10 @@ class MapleToolbox(tk.Tk):
         missing = [c for c in checks if not c["ok"]]
         if missing:
             self.directory_health_var.set(f"{len(missing)} directory item(s) need attention.")
+            self._set_directory_health_collapsed(False)
         else:
             self.directory_health_var.set("All checked directories are healthy.")
+            self._set_directory_health_collapsed(True)
 
     def check_directory_health(self):
         checks = self.directory_health_status()
@@ -2076,8 +2786,8 @@ class MapleToolbox(tk.Tk):
             ("toolbox", "Maple Toolbox"),
             ("capture", "Equipment Bag Screenshot Capture Tool"),
             ("mapleocr", "MapleOCR"),
-            ("mapleforge", "MapleForge"),
             ("bismirpg", "BISMIRPG"),
+            ("mapleforge", "MapleForge"),
         ]
 
         up_to_date = 0
@@ -2243,17 +2953,39 @@ class MapleToolbox(tk.Tk):
     def _create_live_log(self, title: str):
         win = tk.Toplevel(self)
         win.title(title)
-        win.geometry("940x660")
+        win.geometry(saved_window_geometry("ocr_run_window", "940x660"))
         win.minsize(780, 520)
         win.configure(bg="#0c1117")
 
-        win.transient(self)
+        # Deliberately NOT transient to the main Toolbox window.
+        # This keeps the OCR run visible when Toolbox itself is minimized.
         win.attributes("-topmost", True)
         win.lift()
         try:
             win.focus_force()
         except tk.TclError:
             pass
+
+        geometry_state = {"after": None}
+
+        def remember_geometry(_event=None):
+            if geometry_state["after"] is not None:
+                try:
+                    win.after_cancel(geometry_state["after"])
+                except tk.TclError:
+                    pass
+
+            def commit_geometry():
+                geometry_state["after"] = None
+                try:
+                    if win.state() == "normal":
+                        save_window_geometry("ocr_run_window", win.geometry())
+                except tk.TclError:
+                    pass
+
+            geometry_state["after"] = win.after(500, commit_geometry)
+
+        win.bind("<Configure>", remember_geometry, add="+")
 
         outer = ttk.Frame(win, padding=12)
         outer.pack(fill="both", expand=True)
@@ -2525,12 +3257,13 @@ class MapleToolbox(tk.Tk):
                     return
                 try:
                     if seconds > 0:
-                        footer_text.configure(
-                            text=f"{mode} COMPLETE — this window will close in {seconds} seconds"
-                        )
+                        message = f"{mode} COMPLETE — this window will close in {seconds} seconds"
+                        footer_text.configure(text=message)
+                        self._append_live_log(box, f"[Toolbox] Closing in {seconds}...\n")
                         self.after(1000, close_countdown, seconds - 1)
                     else:
                         footer_text.configure(text=f"{mode} COMPLETE — closing...")
+                        self._append_live_log(box, "[Toolbox] Closing now.\n")
                         self.after(250, win.destroy)
                 except tk.TclError:
                     pass
@@ -2682,8 +3415,8 @@ class MapleToolbox(tk.Tk):
         rows = [
             ("MapleOCR", self.mapleocr_dir_var, "mapleocr"),
             ("Equipment Bag Screenshot Capture Tool", self.capture_dir_var, "capture"),
-            ("MapleForge", self.mapleforge_dir_var, "mapleforge"),
             ("BISMIRPG", self.bismirpg_dir_var, "bismirpg"),
+            ("MapleForge", self.mapleforge_dir_var, "mapleforge"),
         ]
 
         for idx, (label, variable, key) in enumerate(rows, start=1):
@@ -2779,8 +3512,8 @@ class MapleToolbox(tk.Tk):
         folder_specs = [
             ("mapleocr", "MapleOCR", self.mapleocr_dir_var),
             ("capture", "EquipmentBagCaptureTool", self.capture_dir_var),
-            ("mapleforge", "MapleForge", self.mapleforge_dir_var),
             ("bismirpg", "BISMIRPG", self.bismirpg_dir_var),
+            ("mapleforge", "MapleForge", self.mapleforge_dir_var),
         ]
 
         checks = {}
@@ -2961,10 +3694,31 @@ class MapleToolbox(tk.Tk):
                 )
             )
 
+    def _apply_button_tooltips(self):
+        tips = {'Check Directories': 'Checks that the configured Toolbox, MapleOCR, screenshot, Results, Output and module folders exist. Run this first on a new PC.', 'Create Safe Missing Folders': 'Creates only safe missing folders such as screenshots, Results, Output and Errors. It does not move or delete your existing files.', 'Open Errors Folder': 'Opens the Toolbox Errors folder. Successful runs do not create logs here; only failures are kept.', 'Check Requirements': 'Checks Windows, PowerShell, winget, Git, AutoHotkey v2, ShareX and the MapleOCR Python environment.', 'Install Missing Requirements': 'Offers to install missing prerequisites visibly. Nothing is installed silently or without your approval.', 'Re-check': 'Runs the requirements check again after you install or fix something.', 'Check for Updates': 'Checks public GitHub releases for Maple Toolbox and supported modules. Internet access is required.', 'Refresh Status': 'Re-scans local module folders, then refreshes installed versions and GitHub release status.', 'Open Updates Log': 'Opens the update-check history so you can see what Toolbox found on earlier checks.', 'Launch Capture': 'Launches the Equipment Bag Screenshot Capture Tool from its selected Operating Folder.', 'Calibrate': 'Starts capture-tool calibration so screen positions can be matched to this PC and game window.', 'Bag Screenshots': 'Opens the normal equipment bag screenshot folder used by MapleOCR.', 'Equipped Screenshots': 'Opens the Equipped screenshot folder. These screenshots are treated as the gear currently worn in the Basic Preset.', 'GitHub Release': 'Opens the latest public GitHub release for this module.', 'Dry Run': 'Scans and validates the current screenshots without doing the final optimiser handoff. Use this first if you want to check OCR results safely.', 'Real Run': 'Processes the current screenshot batch and writes the OCR/import outputs. After this, import mapleupload.txt into the optimiser and export a fresh mapleexport.txt before building BIS_stats.zip.', 'Open Output': 'Opens MapleOCR Output so you can inspect the latest generated files and ZIPs.', 'Open mapleupload': 'Opens mapleupload.txt. Import this into the optimiser after the OCR run.', 'Open MapleOCR Folder': 'Opens the configured MapleOCR Operating Folder.', 'Open mapleexport': 'Opens the current mapleexport.txt. For BIS work this should be freshly exported from the optimiser after importing the latest mapleupload.txt.', 'Open Latest ZIP': 'Opens the newest MapleOCR output ZIP without extracting it.', 'Choose ZIP...': 'Lets you choose a specific MapleOCR ZIP to inspect.', 'Choose ZIP': 'Lets you choose a specific ZIP to inspect.', 'Generate BIS Report': 'BIS workflow: OCR scan → import mapleupload.txt into optimiser → export fresh mapleexport.txt → build/validate BIS_stats.zip → generate report. Do not use a stale mapleexport.txt.', 'Open BIS Reports': 'Opens the BISMIRPG Reports folder containing generated BIS PDF and Lock/Unlock outputs.', 'Open BISMIRPG Folder': 'Opens the configured BISMIRPG Operating Folder.', 'Select Operating Folder': 'Choose the folder where this module is installed or should operate. Folder names can be different on each PC.', 'GitHub Repository': "Opens this module's GitHub repository.", 'Send Feedback / Report a Problem': 'Opens an email to maple@arcadeheaven.com with Toolbox and Windows version details. If there is an error log, attach it.'}
+
+        def walk(widget):
+            try:
+                children = widget.winfo_children()
+            except Exception:
+                return
+            for child in children:
+                try:
+                    if isinstance(child, (ttk.Button, tk.Button)):
+                        text = str(child.cget("text"))
+                        tip = tips.get(text)
+                        if tip:
+                            add_tooltip(child, tip)
+                except Exception:
+                    pass
+                walk(child)
+
+        walk(self)
+
     def show_about(self):
         messagebox.showinfo(
             "About Maple Toolbox",
-            "Maple Toolbox v0.23\n\n"
+            f"Maple Toolbox {APP_VERSION}\n\n"
             "One Toolbox to run them all.\n\n"            f"Feedback: {FEEDBACK_EMAIL}\n\n"
             "A Windows control panel for the separate MapleStory Idle RPG tools."
         )
