@@ -1,0 +1,55 @@
+name: Finalize plain MapleToolbox source
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rebuild and validate source
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, zlib, py_compile
+
+          payload = Path('payload')
+          parts = sorted(payload.glob('part*.txt'))
+          if not parts:
+              raise SystemExit('No payload parts found')
+
+          encoded = ''.join(p.read_text(encoding='utf-8').strip() for p in parts)
+          source = zlib.decompress(base64.b64decode(encoded))
+          Path('MapleToolbox.py').write_bytes(source)
+          py_compile.compile('MapleToolbox.py', doraise=True)
+          print(f'Validated MapleToolbox.py: {len(source)} bytes')
+          PY
+
+      - name: Remove temporary publishing files
+        shell: bash
+        run: |
+          rm -rf payload
+          rm -f .github/workflows/cleanup-source.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+
+      - name: Commit clean public source
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+            exit 0
+          fi
+          git commit -m "Publish MapleToolbox v0.23 plain source"
+          git push
