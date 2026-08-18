@@ -4,6 +4,16 @@
 
 Maple Toolbox is a Windows control panel for the separate MapleStory Idle RPG tools.
 
+## Quick start
+
+1. Go to **Releases** and download the latest `MapleToolbox_*.zip` file.
+2. Extract the ZIP to a folder of your choice.
+3. Open the extracted folder.
+4. Double-click `run_MapleToolbox.bat`.
+5. Start at **Directory Health**, then run **System Requirements**.
+
+Do not run Maple Toolbox from inside the ZIP file — extract it first.
+
 ## Public Beta baseline
 
 ### Workflow
