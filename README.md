@@ -1,4 +1,4 @@
-# Maple Toolbox v0.25 Public Beta
+# Maple Toolbox v0.26 Public Beta
 
 > ## ⚠️ WINDOWS PC ONLY
 > **Maple Toolbox is designed for Windows 10/11 PCs.**
@@ -28,32 +28,46 @@ Maple Toolbox is a Windows desktop control panel for the MapleStory: Idle RPG ut
 3. GitHub Update Manager
 4. Equipment Bag Screenshot Capture Tool
 5. MapleOCR
-6. ZIP Inspector
-7. BISMIRPG
+6. BISMIRPG
+7. ZIP Inspector
 8. MapleForge
 
 MapleForge remains unreleased and is shown last.
 
-## What's new in v0.25
+## What's new in v0.26
 
-- **Directory Health** and **System Requirements** automatically collapse to a compact `All OK ✓` row when every check passes. Use **Show Details** to reopen them; any later problem automatically expands the section again.
-- **BISMIRPG** is now a working Toolbox module and can generate BIS reports from the current `BIS_stats.zip`.
-- BIS handoff validation checks both optimiser preset IDs and OCR Equipped IDs before report generation, catching stale/mismatched `mapleexport.txt` data before the generator runs.
-- Hover **tooltips** have been added to the main action buttons, including first-time workflow guidance.
-- MapleOCR Dry/Real Run windows show live progress, elapsed time, activity/heartbeat output and a visible close countdown.
-- Toolbox run windows are independent of the main Toolbox window and remember their last position/size, including multi-monitor setups.
-- Successful Toolbox-launched CMD/PowerShell jobs show a visible countdown before closing; failure windows stay open.
-- Toolbox-owned shell output is copied to the Windows clipboard for easier support, Discord and email sharing.
-- Brighter Maple Toolbox **taskbar/window icon**. No artwork has been added inside the GUI.
-- Windows-only setup guidance and feedback/reporting have been improved.
+- **BISMIRPG v1.0.0 integration** now uses the generator's supported command-line interface instead of patching source code.
+- **Generated BIS Report picker** shows the latest report automatically and lets you select older reports.
+- Direct **Open Selected Report** and **Open Lock-Unlock TXT** actions.
+- The latest selected BIS report is visually highlighted.
+- **Approved BIS baseline** status is shown in the GUI.
+- **Approve Current BIS** saves the current BIS state as the approved comparison baseline.
+- Future reports use that approved state for the BIS report's light-grey changed-cell shading.
+- If no baseline exists, Toolbox warns that changed-cell shading cannot appear.
+- Same-run baseline comparisons are detected before launch and handled cleanly.
+- BISMIRPG report generation no longer opens Explorer automatically.
+- Successful BISMIRPG CMD windows close correctly after the visible countdown.
+- Shell output is copied to the Windows clipboard.
+- BISMIRPG local release detection now recognises semantic versions such as **v1.0.0**.
+- Development Toolbox builds are distinguished from the latest public release in the Update Manager.
+- BISMIRPG is now workflow section **6** and ZIP Inspector is **7**.
+- Main window title now uses the central app version, preventing stale version text.
+- Directory Health and System Requirements retain the v0.25 auto-collapse behaviour once fully green.
+- Hover help, independent run windows, multi-monitor position memory and visible close countdowns remain enabled.
 
 ## BIS Workflow
 
-For a current BIS report, use this order:
+Use this order for a current BIS report:
 
 `OCR scan → import mapleupload.txt into optimiser → export fresh mapleexport.txt → rebuild/refresh BIS_stats.zip → Generate BIS Report`
 
-Do not use an old `mapleexport.txt` with a new OCR scan. Toolbox validates the handoff and stops the BIS run if required equipment IDs do not match.
+Do not use an old `mapleexport.txt` with a new OCR scan.
+
+For change shading:
+
+`Generate BIS Report → Approve Current BIS → future BIS reports compare against that approved baseline`
+
+Generating a report does **not** silently replace the approved baseline.
 
 ## GitHub Update Manager
 
@@ -80,6 +94,7 @@ Private or unreleased modules such as MapleForge are shown separately and do not
 - Errors only are logged under `Errors\`.
 - Failed runs stay open so the error can be read.
 - Successful run windows show a visible close countdown.
+- Toolbox-owned shell results are copied to the clipboard.
 
 ## Feedback
 
