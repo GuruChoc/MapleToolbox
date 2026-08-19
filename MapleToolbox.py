@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import ctypes
 import os
 import platform
@@ -21,11 +22,12 @@ from tkinter import ttk, filedialog, messagebox
 
 
 APP_NAME = "Maple Toolbox"
-APP_VERSION = "v0.26"
+APP_VERSION = "v0.28"
 VISIBLE_CONSOLE_COUNTDOWN_SECONDS = 8  # Successful visible console runs count down before closing.
 FEEDBACK_EMAIL = "maple@arcadeheaven.com"
 TAGLINE = "One Toolbox to run them all."
-DEFAULT_ROOT = Path(r"C:\MapleOCR")
+DEFAULT_PROJECTS_ROOT = Path(r"C:\MapleProjects")
+DEFAULT_ROOT = DEFAULT_PROJECTS_ROOT / "MapleOCR"
 CAPTURE_REPO = "GuruChoc/EquipmentBagCaptureTool"
 CAPTURE_RELEASE_API = f"https://api.github.com/repos/{CAPTURE_REPO}/releases/latest"
 CAPTURE_RELEASE_WEB = f"https://github.com/{CAPTURE_REPO}/releases/latest"
@@ -930,6 +932,7 @@ class MapleToolbox(tk.Tk):
             value=cfg.get("mapleocr_dir", cfg.get("mapleocr_root", str(DEFAULT_ROOT)))
         )
         self.capture_dir_var = tk.StringVar(value=cfg.get("capture_dir", ""))
+        self.projects_root_var = tk.StringVar(value=r"C:\MapleProjects")
         self.mapleocr_dir_var = tk.StringVar(
             value=cfg.get("mapleocr_dir", cfg.get("mapleocr_root", str(DEFAULT_ROOT)))
         )
@@ -1269,32 +1272,40 @@ class MapleToolbox(tk.Tk):
         self.directory_health_actions.grid(
             row=row, column=0, columnspan=4, sticky="ew"
         )
-        self._configure_four_columns(self.directory_health_actions)
+        for i in range(5):
+            self.directory_health_actions.columnconfigure(i, weight=1, uniform="dirhealth")
 
         ttk.Button(
             self.directory_health_actions,
             text="Check Directories",
             style="Accent.TButton",
             command=self.check_directory_health,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ttk.Button(
+            self.directory_health_actions,
+            text="Change Directories",
+            command=self.open_settings,
+        ).grid(row=0, column=1, sticky="ew", padx=4)
 
         ttk.Button(
             self.directory_health_actions,
             text="Create Safe Missing Folders",
             command=self.create_safe_missing_folders,
-        ).grid(row=0, column=1, sticky="ew", padx=6)
+        ).grid(row=0, column=2, sticky="ew", padx=4)
 
         ttk.Button(
             self.directory_health_actions,
             text="Open Errors Folder",
             command=self.open_errors_folder,
-        ).grid(row=0, column=2, sticky="ew", padx=6)
+        ).grid(row=0, column=3, sticky="ew", padx=4)
 
         ttk.Button(
             self.directory_health_actions,
             text="Re-check",
             command=self.check_directory_health,
-        ).grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        ).grid(row=0, column=4, sticky="ew", padx=(4, 0))
+
 
         self.directory_health_summary_frame = ttk.Frame(card, style="Card.TFrame")
         self.directory_health_summary_frame.grid(
@@ -1521,13 +1532,24 @@ class MapleToolbox(tk.Tk):
         row += 1
 
         ttk.Button(
-            card, text="Generate BIS Report", style="Accent.TButton",
-            command=self.run_bismirpg_report,
+            card, text="Build BIS + Generate Report", style="Accent.TButton",
+            command=self.build_bis_and_generate_report,
         ).grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6))
         ttk.Button(
             card, text="Open BIS Reports",
             command=self.open_bismirpg_reports,
         ).grid(row=row, column=2, columnspan=2, sticky="ew", padx=(6, 0))
+        row += 1
+
+        ttk.Button(
+            card, text="Generate Existing BIS ZIP",
+            command=self.run_bismirpg_report,
+        ).grid(row=row, column=0, columnspan=2, sticky="ew", padx=(0, 6), pady=(8, 0))
+        ttk.Label(
+            card,
+            text="Use only when BIS_stats.zip is already current.",
+            style="CardSubtle.TLabel",
+        ).grid(row=row, column=2, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
         row += 1
 
         # Report picker: defaults to newest PDF and allows older generated reports.
@@ -1968,6 +1990,233 @@ class MapleToolbox(tk.Tk):
         except Exception:
             return None
 
+    def _bis_freshness_status(self):
+        root = self.root_path()
+        pending = root / "BIS_stats_PENDING_v195.txt"
+        export = root / "mapleexport.txt"
+        bis_zip = root / "BIS_stats.zip"
+
+        status = {
+            "pending": pending if pending.exists() else None,
+            "export": export if export.exists() else None,
+            "bis_zip": bis_zip if bis_zip.exists() else None,
+            "export_fresh_enough": True,
+            "zip_fresh_enough": True,
+        }
+
+        if pending.exists():
+            pending_mtime = pending.stat().st_mtime
+            if not export.exists() or export.stat().st_mtime < pending_mtime:
+                status["export_fresh_enough"] = False
+            if not bis_zip.exists() or bis_zip.stat().st_mtime < pending_mtime:
+                status["zip_fresh_enough"] = False
+
+        return status
+
+    def _ensure_bis_builder_portable_root(self, builder: Path):
+        """Force v195 BIS builder to use the configured MapleOCR folder."""
+        txt = builder.read_text(encoding="utf-8", errors="replace")
+        lines = txt.splitlines()
+        changed = False
+
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped == 'base = Path(r"configured MapleOCR folder")':
+                indent = line[:len(line) - len(line.lstrip())]
+                lines[idx] = indent + "base = Path(__file__).resolve().parent"
+                changed = True
+                break
+
+        if changed:
+            builder.write_text(
+                "\n".join(lines) + ("\n" if txt.endswith("\n") else ""),
+                encoding="utf-8",
+            )
+
+        verify = builder.read_text(encoding="utf-8", errors="replace")
+        if 'base = Path(r"configured MapleOCR folder")' in verify:
+            raise RuntimeError(
+                "BIS builder still contains the legacy MapleOCR root."
+            )
+        if "base = Path(__file__).resolve().parent" not in verify:
+            raise RuntimeError(
+                "Could not verify the BIS builder MapleOCR root."
+            )
+
+    def build_bis_and_generate_report(self):
+        root = self.root_path()
+        builder = root / "build_bis_stats_v195.py"
+        vpy = root / ".venv" / "Scripts" / "python.exe"
+        pending = root / "BIS_stats_PENDING_v195.txt"
+        export = root / "mapleexport.txt"
+
+        if not builder.exists():
+            messagebox.showerror(
+                "BIS Builder Missing",
+                f"Could not find:\n\n{builder}\n\n"
+                "Use Repair MapleOCR Paths first."
+            )
+            return
+
+        if not vpy.exists():
+            messagebox.showerror(
+                "MapleOCR Python Missing",
+                f"Could not find:\n\n{vpy}"
+            )
+            return
+
+        try:
+            self._ensure_bis_builder_portable_root(builder)
+        except Exception as exc:
+            messagebox.showerror(
+                "BIS Builder Path Repair Failed",
+                str(exc) + "\n\nNothing was generated."
+            )
+            return
+
+        # If a Real Run is pending, the optimiser export must be newer than it.
+        if pending.exists():
+            if not export.exists() or export.stat().st_mtime < pending.stat().st_mtime:
+                messagebox.showwarning(
+                    "Fresh Optimiser Export Required",
+                    "A newer MapleOCR Real Run is waiting for BIS processing.\n\n"
+                    "Before BIS can be built:\n\n"
+                    "1. Import the current mapleupload.txt into the optimiser.\n"
+                    "2. Export a fresh mapleexport.txt back to the MapleOCR folder.\n"
+                    "3. Click Build BIS + Generate Report again.\n\n"
+                    f"Pending marker:\n{pending}"
+                )
+                return
+
+        progress = tk.Toplevel(self)
+        progress.title("Maple Toolbox — Build BIS + Generate Report")
+        progress.geometry("900x500")
+        progress.minsize(720, 400)
+        progress.configure(bg="#0c1117")
+
+        outer = ttk.Frame(progress, padding=16)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(
+            outer, text="Building BIS_stats.zip", style="Section.TLabel"
+        ).pack(anchor="w")
+
+        status_var = tk.StringVar(value="Starting BIS builder...")
+        ttk.Label(
+            outer, textvariable=status_var, style="CardSubtle.TLabel"
+        ).pack(anchor="w", pady=(4, 10))
+
+        log = tk.Text(
+            outer, bg="#090d12", fg="#e8eef7",
+            insertbackground="#ffffff", relief="flat", wrap="word"
+        )
+        log.pack(fill="both", expand=True)
+
+        def append(text):
+            try:
+                log.insert("end", text)
+                if not text.endswith("\n"):
+                    log.insert("end", "\n")
+                log.see("end")
+            except tk.TclError:
+                pass
+
+        def copy_output():
+            try:
+                text = log.get("1.0", "end-1c")
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.update()
+            except Exception:
+                pass
+
+        ttk.Button(outer, text="Copy Output", command=copy_output).pack(
+            anchor="w", pady=(10, 0)
+        )
+
+        def worker():
+            try:
+                cmd = [str(vpy), str(builder)]
+                self.after(0, append, f"Operating folder: {root}")
+                self.after(0, append, "Building fresh BIS_stats.zip...")
+                self.after(0, append, "")
+
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(root),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    self.after(0, append, line.rstrip("\r\n"))
+                rc = proc.wait()
+
+                bis_zip = root / "BIS_stats.zip"
+                legacy_zip = Path(r"configured MapleOCR folder") / "BIS_stats.zip"
+                if rc == 0 and not bis_zip.exists() and legacy_zip.exists():
+                    self.after(
+                        0, append,
+                        "ERROR: builder wrote BIS_stats.zip to legacy configured MapleOCR folder."
+                    )
+
+                if rc != 0 or not bis_zip.exists():
+                    def failed():
+                        append("")
+                        append(f"BIS BUILD FAILED — exit code {rc}")
+                        status_var.set("BIS BUILD FAILED")
+                        copy_output()
+                        messagebox.showerror(
+                            "BIS Build Failed",
+                            "BIS_stats.zip was not created.\n\n"
+                            "The full builder output has been copied to the clipboard."
+                        )
+                    self.after(0, failed)
+                    return
+
+                # Require the newly-created ZIP to be at least as new as the pending run.
+                if pending.exists() and bis_zip.stat().st_mtime < pending.stat().st_mtime:
+                    def stale():
+                        append("")
+                        append("BIS BUILD BLOCKED — generated ZIP is older than the pending OCR run.")
+                        status_var.set("BIS BUILD BLOCKED — stale ZIP")
+                        copy_output()
+                        messagebox.showerror(
+                            "Stale BIS ZIP",
+                            "BIS_stats.zip is older than the current pending OCR run.\n\n"
+                            "Report generation has been stopped."
+                        )
+                    self.after(0, stale)
+                    return
+
+                def success():
+                    append("")
+                    append(f"BIS BUILD COMPLETE: {bis_zip}")
+                    status_var.set("BIS build complete — starting report generator...")
+                    copy_output()
+                    try:
+                        progress.destroy()
+                    except tk.TclError:
+                        pass
+                    self.run_bismirpg_report()
+                self.after(0, success)
+
+            except Exception as exc:
+                def failed_exc():
+                    append("")
+                    append("BIS BUILD FAILED:")
+                    append(str(exc))
+                    status_var.set("BIS BUILD FAILED")
+                    copy_output()
+                    messagebox.showerror("BIS Build Failed", str(exc))
+                self.after(0, failed_exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def run_bismirpg_report(self):
         bis_folder = self.module_folder("bismirpg")
         if not bis_folder or not bis_folder.exists():
@@ -1982,6 +2231,19 @@ class MapleToolbox(tk.Tk):
             messagebox.showwarning(
                 "BISMIRPG generator not found",
                 f"Could not find:\n{generator}\n\nUse Get Release / Update first."
+            )
+            return
+
+        freshness = self._bis_freshness_status()
+        if not freshness["zip_fresh_enough"]:
+            pending = freshness["pending"]
+            messagebox.showwarning(
+                "BIS_stats.zip is stale",
+                "A newer MapleOCR Real Run exists than the current BIS_stats.zip.\n\n"
+                "Toolbox will not generate a report from the stale ZIP.\n\n"
+                "Use Build BIS + Generate Report after importing mapleupload.txt into "
+                "the optimiser and exporting a fresh mapleexport.txt.\n\n"
+                + (f"Pending marker:\n{pending}" if pending else "")
             )
             return
 
@@ -2735,6 +2997,415 @@ pause
             )
 
 
+
+    def _unified_mapleocr_target(self) -> Path:
+        return Path(r"C:\\MapleProjects") / "MapleOCR"
+
+    def _patch_mapleocr_for_portable_root(self, root: Path):
+        real_script = root / "run_v195_full_inventory.ps1"
+        real_text = """$Root = $PSScriptRoot
+Set-Location $Root
+& "$Root\\.venv\\Scripts\\Activate.ps1"
+
+Write-Host ""
+Write-Host "Running MapleOCR v195 REAL run..."
+Write-Host ""
+
+python "$Root\\maple_batch_importer_easyocr_v195.py" `
+    "$Root\\screenshots" `
+    "$Root\\mapleexport.txt" `
+    --full-inventory `
+    --output-dir "$Root\\Results"
+
+if ($LASTEXITCODE -ne 0) {
+    Write-Host ""
+    Write-Host "OCR returned exit code $LASTEXITCODE."
+    Write-Host "Check $Root\\Output_v195_check.zip for review details."
+    exit $LASTEXITCODE
+}
+
+Write-Host ""
+Write-Host "DONE"
+Write-Host "Results:      $Root\\Results"
+Write-Host "Upload JSON:  $Root\\mapleupload.txt"
+Write-Host "Check ZIP:    $Root\\Output_v195_check.zip"
+Write-Host ""
+Write-Host "BIS_stats.zip is intentionally NOT created yet."
+Write-Host "After optimiser import + fresh export, run:"
+Write-Host "  .\\build_BIS_stats_v195.ps1"
+Write-Host ""
+"""
+        if real_script.exists():
+            real_script.write_text(real_text, encoding="utf-8")
+            twin = root / "run_v195_full_inventory_and_zip.ps1"
+            if twin.exists():
+                twin.write_text(real_text, encoding="utf-8")
+
+        dry_script = root / "run_v195_full_inventory_dry_run.ps1"
+        if dry_script.exists():
+            dry_script.write_text("""$Root = $PSScriptRoot
+Set-Location $Root
+& "$Root\\.venv\\Scripts\\Activate.ps1"
+
+python "$Root\\maple_batch_importer_easyocr_v195.py" `
+    "$Root\\screenshots" `
+    "$Root\\mapleexport.txt" `
+    --dry-run `
+    --full-inventory `
+    --output-dir "$Root\\Results"
+""", encoding="utf-8")
+
+        bis_ps1 = root / "build_BIS_stats_v195.ps1"
+        if bis_ps1.exists():
+            bis_ps1.write_text("""$Root = $PSScriptRoot
+Set-Location $Root
+& "$Root\\.venv\\Scripts\\Activate.ps1"
+
+python "$Root\\build_bis_stats_v195.py"
+
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+Write-Host ""
+Write-Host "Ready to upload:"
+Write-Host "  $Root\\BIS_stats.zip"
+""", encoding="utf-8")
+
+        open_results = root / "open_v195_results.ps1"
+        if open_results.exists():
+            open_results.write_text("""$results = Join-Path $PSScriptRoot "Results"
+if (-not (Test-Path $results)) {
+    New-Item -ItemType Directory -Path $results -Force | Out-Null
+}
+Start-Process explorer.exe $results
+""", encoding="utf-8")
+
+        bis_py = root / "build_bis_stats_v195.py"
+        if bis_py.exists():
+            txt = bis_py.read_text(encoding="utf-8", errors="replace")
+            lines = txt.splitlines()
+            changed = False
+            for idx, line in enumerate(lines):
+                if line.strip() == 'base = Path(r"configured MapleOCR folder")':
+                    indent = line[:len(line) - len(line.lstrip())]
+                    lines[idx] = indent + "base = Path(__file__).resolve().parent"
+                    changed = True
+                    break
+            if changed:
+                bis_py.write_text("\n".join(lines) + ("\n" if txt.endswith("\n") else ""), encoding="utf-8")
+
+        cleaner = root / "MapleOCR_Directory_Cleaner.bat"
+        if cleaner.exists():
+            raw = cleaner.read_text(encoding="utf-8", errors="replace")
+            m = re.search(r"-EncodedCommand\\s+([A-Za-z0-9+/=]+)", raw)
+            if m:
+                try:
+                    ps = base64.b64decode(m.group(1)).decode("utf-16le")
+                    ps = ps.replace('$Root = "configured MapleOCR folder"', '$Root = $PSScriptRoot')
+                    encoded = base64.b64encode(ps.encode("utf-16le")).decode("ascii")
+                    raw = raw[:m.start(1)] + encoded + raw[m.end(1):]
+                    cleaner.write_text(raw, encoding="utf-8")
+                except Exception:
+                    pass
+
+    def _create_mapleocr_venv(self, target: Path):
+        py = shutil.which("py.exe") or shutil.which("python.exe") or shutil.which("python")
+        if not py:
+            raise RuntimeError("Python was not found. Run System Requirements first.")
+
+        if Path(py).name.lower() == "py.exe":
+            create_cmd = [py, "-3.12", "-m", "venv", str(target / ".venv")]
+        else:
+            create_cmd = [py, "-m", "venv", str(target / ".venv")]
+
+        result = subprocess.run(create_cmd, cwd=str(target), capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("Could not create new MapleOCR venv.\n\n" + (result.stdout or "") + "\n" + (result.stderr or ""))
+
+        requirements = target / "requirements.txt"
+        vpy = target / ".venv" / "Scripts" / "python.exe"
+
+        # Install CUDA-enabled PyTorch first so EasyOCR does not pull the CPU-only
+        # wheel from the default PyPI index. RTX 40-series cards are supported by
+        # the official CUDA wheel.
+        cuda_install = [
+            str(vpy), "-m", "pip", "install",
+            "torch==2.11.0",
+            "torchvision==0.26.0",
+            "torchaudio==2.11.0",
+            "--index-url", "https://download.pytorch.org/whl/cu128",
+        ]
+        result = subprocess.run(
+            cuda_install, cwd=str(target), capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "CUDA-enabled PyTorch install failed.\n\n"
+                + (result.stdout or "") + "\n" + (result.stderr or "")
+            )
+
+        if requirements.exists():
+            result = subprocess.run(
+                [str(vpy), "-m", "pip", "install", "-r", str(requirements)],
+                cwd=str(target), capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise RuntimeError("Python package install failed.\n\n" + (result.stdout or "") + "\n" + (result.stderr or ""))
+
+        # Hard verification: do not report migration complete if CUDA is absent.
+        verify = subprocess.run(
+            [
+                str(vpy), "-c",
+                (
+                    "import torch; "
+                    "print('torch', torch.__version__); "
+                    "print('cuda', torch.version.cuda); "
+                    "print('available', torch.cuda.is_available()); "
+                    "print('device', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE'); "
+                    "raise SystemExit(0 if torch.cuda.is_available() else 2)"
+                )
+            ],
+            cwd=str(target), capture_output=True, text=True
+        )
+        if verify.returncode != 0:
+            raise RuntimeError(
+                "PyTorch installed, but CUDA is not available in the new MapleOCR venv.\n\n"
+                + (verify.stdout or "") + "\n" + (verify.stderr or "")
+            )
+
+
+    def repair_mapleocr_paths(self):
+        root = self.root_path()
+        if not root.exists():
+            messagebox.showerror(
+                "MapleOCR Path Repair",
+                f"MapleOCR Operating Folder does not exist:\n\n{root}"
+            )
+            return
+
+        try:
+            self._patch_mapleocr_for_portable_root(root)
+
+            bis_py = root / "build_bis_stats_v195.py"
+            still_old = False
+            if bis_py.exists():
+                txt = bis_py.read_text(encoding="utf-8", errors="replace")
+                still_old = 'Path(r"configured MapleOCR folder")' in txt
+
+            if still_old:
+                messagebox.showerror(
+                    "MapleOCR Path Repair",
+                    "The BIS builder still contains the old configured MapleOCR folder root.\n\n"
+                    "Nothing was deleted. Please send this error back for review."
+                )
+                return
+
+            self.status_var.set("MapleOCR portable paths repaired")
+            messagebox.showinfo(
+                "MapleOCR Paths Repaired",
+                f"MapleOCR v195 path references were repaired for:\n\n{root}\n\n"
+                "Now rebuild BIS_stats.zip."
+            )
+        except Exception as exc:
+            messagebox.showerror("MapleOCR Path Repair Failed", str(exc))
+
+    def repair_mapleocr_gpu(self):
+        root = self.root_path()
+        vpy = root / ".venv" / "Scripts" / "python.exe"
+        if not vpy.exists():
+            messagebox.showerror(
+                "MapleOCR GPU Repair",
+                f"Python venv not found:\n\n{vpy}"
+            )
+            return
+
+        if not messagebox.askyesno(
+            "Repair MapleOCR GPU",
+            "Replace the current PyTorch install in the MapleOCR venv with the official CUDA 12.8 build?\n\n"
+            "This download is large and can take several minutes.\n\n"
+            "A live progress window will stay open while it runs."
+        ):
+            return
+
+        progress = tk.Toplevel(self)
+        progress.title("Maple Toolbox — Repair MapleOCR GPU")
+        progress.geometry("940x560")
+        progress.minsize(760, 420)
+        progress.configure(bg="#0c1117")
+
+        outer = ttk.Frame(progress, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer,
+            text="Repairing MapleOCR GPU / CUDA",
+            style="Section.TLabel",
+        ).pack(anchor="w")
+
+        status = tk.StringVar(value="Preparing CUDA-enabled PyTorch install...")
+        ttk.Label(
+            outer,
+            textvariable=status,
+            style="CardSubtle.TLabel",
+        ).pack(anchor="w", pady=(4, 10))
+
+        log = tk.Text(
+            outer,
+            bg="#090d12",
+            fg="#e8eef7",
+            insertbackground="#ffffff",
+            relief="flat",
+            wrap="word",
+        )
+        log.pack(fill="both", expand=True)
+
+        def append(text):
+            try:
+                log.insert("end", text)
+                if not text.endswith("\n"):
+                    log.insert("end", "\n")
+                log.see("end")
+            except tk.TclError:
+                pass
+
+        def copy_all():
+            try:
+                text = log.get("1.0", "end-1c")
+                self.clipboard_clear()
+                self.clipboard_append(text)
+                self.update()
+                status.set("Full GPU repair output copied to clipboard.")
+            except Exception:
+                pass
+
+        button_row = ttk.Frame(outer)
+        button_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(
+            button_row,
+            text="Copy Output",
+            command=copy_all,
+        ).pack(side="left")
+
+        close_button = ttk.Button(
+            button_row,
+            text="Close",
+            command=progress.destroy,
+            state="disabled",
+        )
+        close_button.pack(side="right")
+
+        cmd = [
+            str(vpy), "-m", "pip", "install", "--upgrade", "--force-reinstall",
+            "torch==2.11.0",
+            "torchvision==0.26.0",
+            "torchaudio==2.11.0",
+            "--index-url", "https://download.pytorch.org/whl/cu128",
+        ]
+
+        def stream_process(args):
+            proc = subprocess.Popen(
+                args,
+                cwd=str(root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                self.after(0, append, line.rstrip("\r\n"))
+            return proc.wait()
+
+        def worker():
+            try:
+                self.after(0, status.set, "Downloading/installing CUDA-enabled PyTorch...")
+                self.after(0, append, f"MapleOCR: {root}")
+                self.after(0, append, "")
+                self.after(0, append, "Installing official PyTorch CUDA 12.8 build...")
+                self.after(0, append, "")
+
+                rc = stream_process(cmd)
+                if rc != 0:
+                    def install_failed():
+                        status.set(f"GPU REPAIR FAILED — pip exit code {rc}")
+                        append("")
+                        append(f"GPU REPAIR FAILED — pip exit code {rc}")
+                        copy_all()
+                        close_button.configure(state="normal")
+                        messagebox.showerror(
+                            "MapleOCR GPU Repair Failed",
+                            "PyTorch installation failed.\n\n"
+                            "The full output has been copied to the clipboard."
+                        )
+                    self.after(0, install_failed)
+                    return
+
+                self.after(0, append, "")
+                self.after(0, append, "PyTorch install complete.")
+                self.after(0, append, "")
+                self.after(0, status.set, "Verifying CUDA and NVIDIA GPU...")
+
+                verify_cmd = [
+                    str(vpy), "-c",
+                    (
+                        "import torch; "
+                        "print('Torch:', torch.__version__); "
+                        "print('CUDA runtime:', torch.version.cuda); "
+                        "print('CUDA available:', torch.cuda.is_available()); "
+                        "print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NONE'); "
+                        "raise SystemExit(0 if torch.cuda.is_available() else 2)"
+                    )
+                ]
+                rc2 = stream_process(verify_cmd)
+
+                if rc2 == 0:
+                    def success():
+                        append("")
+                        append("CUDA CHECK: PASS")
+                        status.set("CUDA CHECK: PASS — MapleOCR GPU acceleration restored")
+                        copy_all()
+                        close_button.configure(state="normal")
+                        messagebox.showinfo(
+                            "MapleOCR GPU Restored",
+                            "CUDA is available again.\n\n"
+                            "Run MapleOCR Dry Run now. It should use the NVIDIA GPU."
+                        )
+                    self.after(0, success)
+                else:
+                    def verify_failed():
+                        append("")
+                        append("CUDA CHECK: FAIL")
+                        status.set("CUDA CHECK: FAIL — PyTorch installed but GPU unavailable")
+                        copy_all()
+                        close_button.configure(state="normal")
+                        messagebox.showerror(
+                            "CUDA Still Unavailable",
+                            "PyTorch installed, but CUDA verification failed.\n\n"
+                            "The full output has been copied to the clipboard."
+                        )
+                    self.after(0, verify_failed)
+
+            except Exception as exc:
+                def failed():
+                    append("")
+                    append("GPU REPAIR FAILED:")
+                    append(str(exc))
+                    status.set("GPU REPAIR FAILED")
+                    copy_all()
+                    close_button.configure(state="normal")
+                    messagebox.showerror(
+                        "MapleOCR GPU Repair Failed",
+                        f"{exc}\n\nThe output has been copied to the clipboard."
+                    )
+                self.after(0, failed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
     def directory_health_status(self):
         root = self.root_path()
         checks = []
@@ -2773,26 +3444,64 @@ pause
         for child in self.directory_health_frame.winfo_children():
             child.destroy()
 
-        for row, item in enumerate(checks):
-            symbol = "✓" if item["ok"] else "✗"
-            style = "Good.TLabel" if item["ok"] else "Warn.TLabel"
-            ttk.Label(
-                self.directory_health_frame,
-                text=f"{symbol} {item['label']}",
-                style=style,
-            ).grid(row=row, column=0, sticky="w", pady=2)
-
-            detail = str(item["path"])
-            if not item["ok"] and item["safe_create"]:
-                detail += "  [safe to create]"
-            ttk.Label(
-                self.directory_health_frame,
-                text=detail,
-                style="CardSubtle.TLabel",
-            ).grid(row=row, column=1, sticky="w", padx=(16, 0), pady=2)
-
         self.directory_health_frame.columnconfigure(0, weight=1)
-        self.directory_health_frame.columnconfigure(1, weight=2)
+
+        def add_line(row, text, ok=True, subtle=False):
+            if subtle:
+                style = "CardSubtle.TLabel"
+                prefix = ""
+            else:
+                style = "Good.TLabel" if ok else "Warn.TLabel"
+                prefix = "✓ " if ok else "✗ "
+            ttk.Label(
+                self.directory_health_frame,
+                text=prefix + text,
+                style=style,
+            ).grid(row=row, column=0, sticky="w", pady=3)
+
+        by_label = {item["label"]: item for item in checks}
+        row = 0
+
+        add_line(row, r"Projects root: C:\MapleProjects", subtle=True)
+        row += 2
+
+        # Project-level health only.
+        project_rows = [
+            ("Toolbox folder", "Toolbox"),
+            ("MapleOCR Operating Folder", "MapleOCR"),
+            ("Screenshot Capture Operating Folder", "Equipment Bag Screenshot Capture Tool"),
+            ("BISMIRPG Operating Folder", "BISMIRPG"),
+            ("MapleForge Operating Folder", "MapleForge"),
+        ]
+
+        # MapleOCR project health also includes its required internal working folders,
+        # but those folders are intentionally not shown individually.
+        maple_internal_labels = [
+            "MapleOCR screenshots",
+            "MapleOCR Equipped screenshots",
+            "MapleOCR Results",
+            "MapleOCR Output",
+            "MapleOCR .venv",
+        ]
+
+        for label, friendly in project_rows:
+            item = by_label.get(label)
+            if not item:
+                continue
+
+            ok = item["ok"]
+
+            if label == "MapleOCR Operating Folder":
+                internal = [
+                    by_label[x]["ok"]
+                    for x in maple_internal_labels
+                    if x in by_label
+                ]
+                if internal:
+                    ok = ok and all(internal)
+
+            add_line(row, friendly, ok)
+            row += 1
 
         missing = [c for c in checks if not c["ok"]]
         if missing:
@@ -2801,6 +3510,7 @@ pause
         else:
             self.directory_health_var.set("All checked directories are healthy.")
             self._set_directory_health_collapsed(True)
+
 
     def check_directory_health(self):
         checks = self.directory_health_status()
@@ -3831,10 +4541,74 @@ pause
             except zipfile.BadZipFile:
                 messagebox.showerror("Bad ZIP", chosen)
 
+    def select_projects_root(self):
+        initial = self.projects_root_var.get().strip() or r"C:\MapleProjects"
+        chosen = filedialog.askdirectory(
+            title="Select Maple Projects Root",
+            initialdir=initial if Path(initial).exists() else None,
+        )
+        if chosen:
+            self.projects_root_var.set(chosen)
+            self.detect_projects_from_root(show_result=True)
+
+    def detect_projects_from_root(self, show_result=False):
+        root_text = self.projects_root_var.get().strip()
+        if not root_text:
+            if show_result:
+                messagebox.showwarning("Projects Root", "Select the main projects folder first.")
+            return False
+
+        root = Path(root_text)
+        if not root.exists() or not root.is_dir():
+            if show_result:
+                messagebox.showerror("Projects Root", f"Folder does not exist:\n\n{root}")
+            return False
+
+        expected = [
+            ("MapleOCR", self.mapleocr_dir_var),
+            ("EquipmentBagCaptureTool", self.capture_dir_var),
+            ("BISMIRPG", self.bismirpg_dir_var),
+            ("MapleForge", self.mapleforge_dir_var),
+        ]
+
+        found = []
+        missing = []
+        for folder, variable in expected:
+            candidate = root / folder
+            if candidate.is_dir():
+                variable.set(str(candidate))
+                found.append(folder)
+            else:
+                missing.append(folder)
+
+        toolbox_candidate = root / "MapleToolbox"
+        if toolbox_candidate.is_dir():
+            found.insert(0, "MapleToolbox")
+
+        if show_result:
+            msg = []
+            if found:
+                msg.append("Found:")
+                msg.extend(f"  ✓ {x}" for x in found)
+            if missing:
+                if msg:
+                    msg.append("")
+                msg.append("Not found:")
+                msg.extend(f"  ✗ {x}" for x in missing)
+                msg.append("")
+                msg.append("Found folders were filled in. Missing folders can be selected manually.")
+                messagebox.showwarning("Projects Scan Complete", "\n".join(msg))
+            else:
+                msg.append("")
+                msg.append("All project folders were detected and filled in.")
+                messagebox.showinfo("Projects Scan Complete", "\n".join(msg))
+
+        return not missing
+
     def open_settings(self):
         win = tk.Toplevel(self)
         win.title("Maple Toolbox Settings")
-        win.geometry("860x410")
+        win.geometry("900x500")
         win.configure(bg="#0c1117")
 
         outer = ttk.Frame(win, padding=18)
@@ -3844,6 +4618,29 @@ pause
             row=0, column=0, columnspan=3, sticky="w", pady=(0, 14)
         )
 
+        ttk.Label(
+            outer, text="Projects Root", style="Subtle.TLabel"
+        ).grid(row=1, column=0, sticky="w", pady=6)
+
+        ttk.Entry(
+            outer, textvariable=self.projects_root_var
+        ).grid(row=1, column=1, sticky="ew", padx=8, pady=6)
+
+        ttk.Button(
+            outer, text="Select Root", command=self.select_projects_root
+        ).grid(row=1, column=2, sticky="ew", pady=6)
+
+        ttk.Button(
+            outer,
+            text="Auto-detect Projects",
+            style="Accent.TButton",
+            command=lambda: self.detect_projects_from_root(show_result=True),
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(0, 14))
+
+        ttk.Separator(outer, orient="horizontal").grid(
+            row=3, column=0, columnspan=3, sticky="ew", pady=(0, 10)
+        )
+
         rows = [
             ("MapleOCR", self.mapleocr_dir_var, "mapleocr"),
             ("Equipment Bag Screenshot Capture Tool", self.capture_dir_var, "capture"),
@@ -3851,7 +4648,7 @@ pause
             ("MapleForge", self.mapleforge_dir_var, "mapleforge"),
         ]
 
-        for idx, (label, variable, key) in enumerate(rows, start=1):
+        for idx, (label, variable, key) in enumerate(rows, start=4):
             ttk.Label(outer, text=label, style="Subtle.TLabel").grid(
                 row=idx, column=0, sticky="w", pady=6
             )
@@ -3863,16 +4660,18 @@ pause
                 command=lambda k=key: self.select_module_folder(k)
             ).grid(row=idx, column=2, sticky="ew", pady=6)
 
+        action_row = 4 + len(rows)
         ttk.Button(
-            outer, text="Run First Setup", command=self.show_first_run_wizard
-        ).grid(row=len(rows) + 1, column=1, sticky="ew", pady=(18, 0), padx=(0, 8))
+            outer, text="Repair / Re-run Setup", command=self.show_first_run_wizard
+        ).grid(row=action_row, column=1, sticky="ew", pady=(18, 0), padx=(8, 8))
 
         ttk.Button(
             outer, text="Save / Refresh", style="Accent.TButton",
             command=self.refresh_status
-        ).grid(row=len(rows) + 1, column=2, sticky="ew", pady=(18, 0))
+        ).grid(row=action_row, column=2, sticky="ew", pady=(18, 0))
 
         outer.columnconfigure(1, weight=1)
+
 
     def show_first_run_wizard(self):
         win = tk.Toplevel(self)
@@ -3904,7 +4703,7 @@ pause
             justify="left",
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 18))
 
-        default_base = Path(r"C:\MapleTools")
+        default_base = Path(r"C:\MapleProjects")
         current_root = self.mapleocr_dir_var.get().strip().strip('"')
         if current_root:
             try:
@@ -4127,7 +4926,7 @@ pause
             )
 
     def _apply_button_tooltips(self):
-        tips = {'Check Directories': 'Checks that the configured Toolbox, MapleOCR, screenshot, Results, Output and module folders exist. Run this first on a new PC.', 'Create Safe Missing Folders': 'Creates only safe missing folders such as screenshots, Results, Output and Errors. It does not move or delete your existing files.', 'Open Errors Folder': 'Opens the Toolbox Errors folder. Successful runs do not create logs here; only failures are kept.', 'Check Requirements': 'Checks Windows, PowerShell, winget, Git, AutoHotkey v2, ShareX and the MapleOCR Python environment.', 'Install Missing Requirements': 'Offers to install missing prerequisites visibly. Nothing is installed silently or without your approval.', 'Re-check': 'Runs the requirements check again after you install or fix something.', 'Check for Updates': 'Checks public GitHub releases for Maple Toolbox and supported modules. Internet access is required.', 'Refresh Status': 'Re-scans local module folders, then refreshes installed versions and GitHub release status.', 'Open Updates Log': 'Opens the update-check history so you can see what Toolbox found on earlier checks.', 'Launch Capture': 'Launches the Equipment Bag Screenshot Capture Tool from its selected Operating Folder.', 'Calibrate': 'Starts capture-tool calibration so screen positions can be matched to this PC and game window.', 'Bag Screenshots': 'Opens the normal equipment bag screenshot folder used by MapleOCR.', 'Equipped Screenshots': 'Opens the Equipped screenshot folder. These screenshots are treated as the gear currently worn in the Basic Preset.', 'GitHub Release': 'Opens the latest public GitHub release for this module.', 'Dry Run': 'Scans and validates the current screenshots without doing the final optimiser handoff. Use this first if you want to check OCR results safely.', 'Real Run': 'Processes the current screenshot batch and writes the OCR/import outputs. After this, import mapleupload.txt into the optimiser and export a fresh mapleexport.txt before building BIS_stats.zip.', 'Open Output': 'Opens MapleOCR Output so you can inspect the latest generated files and ZIPs.', 'Open mapleupload': 'Opens mapleupload.txt. Import this into the optimiser after the OCR run.', 'Open MapleOCR Folder': 'Opens the configured MapleOCR Operating Folder.', 'Open mapleexport': 'Opens the current mapleexport.txt. For BIS work this should be freshly exported from the optimiser after importing the latest mapleupload.txt.', 'Open Latest ZIP': 'Opens the newest MapleOCR output ZIP without extracting it.', 'Choose ZIP...': 'Lets you choose a specific MapleOCR ZIP to inspect.', 'Choose ZIP': 'Lets you choose a specific ZIP to inspect.', 'Generate BIS Report': 'BIS workflow: OCR scan → import mapleupload.txt into optimiser → export fresh mapleexport.txt → build/validate BIS_stats.zip → generate report. Do not use a stale mapleexport.txt.', 'Open BIS Reports': 'Opens the BISMIRPG Reports folder containing generated BIS PDF and Lock/Unlock outputs.', 'Open BISMIRPG Folder': 'Opens the configured BISMIRPG Operating Folder.', 'Select Operating Folder': 'Choose the folder where this module is installed or should operate. Folder names can be different on each PC.', 'GitHub Repository': "Opens this module's GitHub repository.", 'Send Feedback / Report a Problem': 'Opens an email to maple@arcadeheaven.com with Toolbox and Windows version details. If there is an error log, attach it.'}
+        tips = {'Check Directories': 'Checks that the configured Toolbox, MapleOCR, screenshot, Results, Output and module folders exist. Run this first on a new PC.', 'Create Safe Missing Folders': 'Creates only safe missing folders such as screenshots, Results, Output and Errors. It does not move or delete your existing files.', 'Open Errors Folder': 'Opens the Toolbox Errors folder. Successful runs do not create logs here; only failures are kept.', 'Check Requirements': 'Checks Windows, PowerShell, winget, Git, AutoHotkey v2, ShareX and the MapleOCR Python environment.', 'Install Missing Requirements': 'Offers to install missing prerequisites visibly. Nothing is installed silently or without your approval.', 'Re-check': 'Runs the requirements check again after you install or fix something.', 'Check for Updates': 'Checks public GitHub releases for Maple Toolbox and supported modules. Internet access is required.', 'Refresh Status': 'Re-scans local module folders, then refreshes installed versions and GitHub release status.', 'Open Updates Log': 'Opens the update-check history so you can see what Toolbox found on earlier checks.', 'Launch Capture': 'Launches the Equipment Bag Screenshot Capture Tool from its selected Operating Folder.', 'Calibrate': 'Starts capture-tool calibration so screen positions can be matched to this PC and game window.', 'Bag Screenshots': 'Opens the normal equipment bag screenshot folder used by MapleOCR.', 'Equipped Screenshots': 'Opens the Equipped screenshot folder. These screenshots are treated as the gear currently worn in the Basic Preset.', 'GitHub Release': 'Opens the latest public GitHub release for this module.', 'Dry Run': 'Scans and validates the current screenshots without doing the final optimiser handoff. Use this first if you want to check OCR results safely.', 'Real Run': 'Processes the current screenshot batch and writes the OCR/import outputs. After this, import mapleupload.txt into the optimiser and export a fresh mapleexport.txt before building BIS_stats.zip.', 'Open Output': 'Opens MapleOCR Output so you can inspect the latest generated files and ZIPs.', 'Open mapleupload': 'Opens mapleupload.txt. Import this into the optimiser after the OCR run.', 'Open MapleOCR Folder': 'Opens the configured MapleOCR Operating Folder.', 'Open mapleexport': 'Opens the current mapleexport.txt. For BIS work this should be freshly exported from the optimiser after importing the latest mapleupload.txt.', 'Open Latest ZIP': 'Opens the newest MapleOCR output ZIP without extracting it.', 'Choose ZIP...': 'Lets you choose a specific MapleOCR ZIP to inspect.', 'Choose ZIP': 'Lets you choose a specific ZIP to inspect.', 'Build BIS + Generate Report': 'After optimiser import/export, builds a fresh BIS_stats.zip, verifies it is current, then generates the BIS report automatically.', 'Generate Existing BIS ZIP': 'Generates a report only from an already-current BIS_stats.zip. Toolbox blocks stale ZIPs.', 'Open BIS Reports': 'Opens the BISMIRPG Reports folder containing generated BIS PDF and Lock/Unlock outputs.', 'Open BISMIRPG Folder': 'Opens the configured BISMIRPG Operating Folder.', 'Select Operating Folder': 'Choose the folder where this module is installed or should operate. Folder names can be different on each PC.', 'GitHub Repository': "Opens this module's GitHub repository.", 'Send Feedback / Report a Problem': 'Opens an email to maple@arcadeheaven.com with Toolbox and Windows version details. If there is an error log, attach it.'}
 
         def walk(widget):
             try:
