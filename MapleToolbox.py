@@ -21,7 +21,7 @@ from tkinter import ttk, filedialog, messagebox
 
 
 APP_NAME = "Maple Toolbox"
-APP_VERSION = "v0.25"
+APP_VERSION = "v0.26"
 VISIBLE_CONSOLE_COUNTDOWN_SECONDS = 8  # Successful visible console runs count down before closing.
 FEEDBACK_EMAIL = "maple@arcadeheaven.com"
 TAGLINE = "One Toolbox to run them all."
@@ -510,55 +510,81 @@ def write_error_log(
 
 def detected_version_from_module_files(folder: Path | None) -> str | None:
     """
-    Best-effort version detection for modules whose release does not include VERSION.
-    Looks at a small set of obvious local files and extracts the highest vNNN token.
+    Best-effort module version detection when a VERSION file is absent.
+
+    Prefer semantic release versions such as v1.0.0 over old internal workflow
+    markers such as v191 found inside source/comments/filenames.
     """
     if not folder or not folder.exists():
         return None
 
-    versions = []
+    semantic_versions = []
+    legacy_versions = []
 
     candidates = [
-        folder / "VERSION",
-        folder / "version.txt",
-        folder / "VERSION.txt",
         folder / "README.md",
+        folder / "README.txt",
+        folder / "RELEASE_NOTES.txt",
         folder / "bis_report_generator.py",
     ]
 
+    try:
+        candidates.extend(
+            p for p in folder.iterdir()
+            if p.is_file() and (
+                p.name.lower().startswith("release_notes")
+                or p.name.lower().startswith("readme")
+            )
+        )
+    except Exception:
+        pass
+
+    seen = set()
     for p in candidates:
-        if not p.exists() or not p.is_file():
+        if p in seen or not p.exists() or not p.is_file():
             continue
+        seen.add(p)
 
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
         except Exception:
-            continue
+            text = ""
+
+        # Full semantic versions are authoritative public-release identifiers.
+        for m in re.finditer(r'(?i)\bv(\d+)\.(\d+)\.(\d+)\b', text):
+            semantic_versions.append(tuple(int(x) for x in m.groups()))
 
         for m in re.finditer(r'(?i)\bv(\d{1,5})\b', text):
             try:
-                versions.append(int(m.group(1)))
+                legacy_versions.append(int(m.group(1)))
             except ValueError:
                 pass
 
-    # Also consider filenames in the module root.
+        # Filenames such as RELEASE_NOTES_v1.0.0.txt are also authoritative.
+        for m in re.finditer(r'(?i)\bv(\d+)\.(\d+)\.(\d+)\b', p.name):
+            semantic_versions.append(tuple(int(x) for x in m.groups()))
+
+    if semantic_versions:
+        major, minor, patch = max(semantic_versions)
+        return f"v{major}.{minor}.{patch}"
+
+    # Legacy fallback only when no semantic public-release version exists.
     try:
         for p in folder.iterdir():
             if not p.is_file():
                 continue
             for m in re.finditer(r'(?i)\bv(\d{1,5})\b', p.name):
                 try:
-                    versions.append(int(m.group(1)))
+                    legacy_versions.append(int(m.group(1)))
                 except ValueError:
                     pass
     except Exception:
         pass
 
-    if versions:
-        return f"v{max(versions)}"
+    if legacy_versions:
+        return f"v{max(legacy_versions)}"
 
     return None
-
 
 
 def latest_error_log() -> Path | None:
@@ -882,7 +908,7 @@ class MapleToolbox(tk.Tk):
     def __init__(self):
         super().__init__()
 
-        self.title(f"{APP_NAME} v0.25")
+        self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("1220x880")
         try:
             if os.name == "nt":
@@ -929,6 +955,10 @@ class MapleToolbox(tk.Tk):
         self.mapleocr_release_var = tk.StringVar(value="Release: not checked")
         self.mapleforge_release_var = tk.StringVar(value="Release: not checked")
         self.bismirpg_release_var = tk.StringVar(value="Release: not checked")
+        self.bis_report_var = tk.StringVar(value="No BIS reports found")
+        self.bis_report_detail_var = tk.StringVar(value="Generate a report or refresh the report list.")
+        self.bis_baseline_var = tk.StringVar(value="Approved BIS baseline: NONE")
+        self._bis_report_paths = {}
 
         self.prereq_summary_var = tk.StringVar(value="Prerequisites not checked yet.")
         self.directory_health_var = tk.StringVar(value="Directory health not checked yet.")
@@ -982,6 +1012,16 @@ class MapleToolbox(tk.Tk):
         style.map("Danger.TButton", background=[("active", "#92505b")])
         style.configure("TEntry", fieldbackground="#0f141b", foreground="#e8eef7",
                         insertcolor="#ffffff")
+        style.configure("Latest.TCombobox", fieldbackground="#dff6df", background="#dff6df",
+                        foreground="#111111")
+        style.map("Latest.TCombobox",
+                  fieldbackground=[("readonly", "#dff6df")],
+                  foreground=[("readonly", "#111111")])
+        style.configure("History.TCombobox", fieldbackground="#ffffff", background="#ffffff",
+                        foreground="#111111")
+        style.map("History.TCombobox",
+                  fieldbackground=[("readonly", "#ffffff")],
+                  foreground=[("readonly", "#111111")])
 
         style.configure(
             "Cylon.Horizontal.TProgressbar",
@@ -1025,6 +1065,7 @@ class MapleToolbox(tk.Tk):
         self._build_update_manager(body)
         self._build_capture(body)
         self._build_mapleocr(body)
+        self._build_bismirpg(body)
         self._build_zip(body)
         self._build_future_modules(body)
 
@@ -1428,7 +1469,7 @@ class MapleToolbox(tk.Tk):
 
         row = self._section_header(
             card,
-            "6. ZIP Inspector",
+            "7. ZIP Inspector",
             "Reads files directly inside Output ZIPs. Nothing is extracted."
         )
 
@@ -1444,7 +1485,6 @@ class MapleToolbox(tk.Tk):
         )
 
     def _build_future_modules(self, parent):
-        self._build_bismirpg(parent)
         self._release_module_card(
             parent,
             "8. MapleForge",
@@ -1461,7 +1501,7 @@ class MapleToolbox(tk.Tk):
 
         row = self._section_header(
             card,
-            "7. BISMIRPG",
+            "6. BISMIRPG",
             "BIS report / Lock-Unlock report module — fresh optimiser export required before BIS report.",
         )
         row = self._operating_folder_row(
@@ -1488,6 +1528,66 @@ class MapleToolbox(tk.Tk):
             card, text="Open BIS Reports",
             command=self.open_bismirpg_reports,
         ).grid(row=row, column=2, columnspan=2, sticky="ew", padx=(6, 0))
+        row += 1
+
+        # Report picker: defaults to newest PDF and allows older generated reports.
+        report_box = ttk.Frame(card, style="Card.TFrame")
+        report_box.grid(
+            row=row, column=0, columnspan=4, sticky="ew", pady=(12, 0)
+        )
+        report_box.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            report_box,
+            text="Generated BIS Report",
+            style="CardSubtle.TLabel",
+        ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        self.bis_report_combo = ttk.Combobox(
+            report_box,
+            textvariable=self.bis_report_var,
+            state="readonly",
+            style="History.TCombobox",
+        )
+        self.bis_report_combo.grid(row=0, column=1, sticky="ew")
+        self.bis_report_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._update_selected_bis_report_detail(),
+        )
+
+        ttk.Button(
+            report_box,
+            text="Refresh Reports",
+            command=self.refresh_bis_report_picker,
+        ).grid(row=0, column=2, sticky="ew", padx=(10, 0))
+
+        ttk.Label(
+            report_box,
+            textvariable=self.bis_report_detail_var,
+            style="CardSubtle.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(7, 0))
+        ttk.Label(
+            report_box,
+            textvariable=self.bis_baseline_var,
+            style="Good.TLabel",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(7, 0))
+        row += 1
+
+        ttk.Button(
+            card,
+            text="Open Selected Report",
+            command=self.open_selected_bis_report,
+        ).grid(row=row, column=0, sticky="ew", padx=(0, 4), pady=(8, 0))
+        ttk.Button(
+            card,
+            text="Open Lock-Unlock TXT",
+            command=self.open_selected_bis_text,
+        ).grid(row=row, column=1, sticky="ew", padx=4, pady=(8, 0))
+        ttk.Button(
+            card,
+            text="Approve Current BIS",
+            command=self.approve_current_bis,
+        ).grid(row=row, column=2, columnspan=2, sticky="ew", padx=(4, 0), pady=(8, 0))
         row += 1
 
         ttk.Button(
@@ -1574,6 +1674,299 @@ class MapleToolbox(tk.Tk):
             open_path(reports)
         except Exception as exc:
             messagebox.showerror("Could not open BIS Reports", str(exc))
+
+    def _discover_bis_reports(self):
+        """Return generated BIS PDFs newest first, paired to their TXT where possible."""
+        try:
+            reports = self._bismirpg_reports_dir()
+        except Exception:
+            return []
+
+        if not reports.exists():
+            return []
+
+        found = []
+        for pdf in reports.glob("*.pdf"):
+            try:
+                modified = pdf.stat().st_mtime
+            except OSError:
+                continue
+
+            # Current Toolbox generator gives PDF/TXT the exact same timestamp suffix.
+            txt = None
+            suffix_match = re.search(r"(\d{8}_\d{6})", pdf.stem)
+            if suffix_match:
+                stamp = suffix_match.group(1)
+                candidates = sorted(
+                    reports.glob(f"*Lock*Unlock*{stamp}*.txt")
+                )
+                if candidates:
+                    txt = candidates[0]
+
+            if txt is None:
+                # v1.0.0 names reports by report date rather than second-level timestamp.
+                date_match = re.search(r"(\d{8})", pdf.stem)
+                if date_match:
+                    date_token = date_match.group(1)
+                    candidates = sorted(
+                        reports.glob(f"*Lock*Unlock*{date_token}*.txt")
+                    )
+                    if candidates:
+                        txt = candidates[0]
+
+            if txt is None:
+                # Fallback: nearest lock/unlock TXT by modification time.
+                txt_candidates = list(reports.glob("*.txt"))
+                if txt_candidates:
+                    txt = min(
+                        txt_candidates,
+                        key=lambda p: abs(p.stat().st_mtime - modified),
+                    )
+                    try:
+                        if abs(txt.stat().st_mtime - modified) > 120:
+                            txt = None
+                    except OSError:
+                        txt = None
+
+            found.append({
+                "pdf": pdf,
+                "txt": txt,
+                "modified": modified,
+            })
+
+        found.sort(key=lambda item: item["modified"], reverse=True)
+        return found
+
+    def refresh_bis_report_picker(self):
+        reports = self._discover_bis_reports()
+        self._bis_report_paths = {}
+
+        if not reports:
+            self.bis_report_var.set("No BIS reports found")
+            self.bis_report_detail_var.set(
+                "No generated BIS PDFs found in the BISMIRPG Reports folder."
+            )
+            try:
+                self.bis_report_combo["values"] = ()
+            except (AttributeError, tk.TclError):
+                pass
+            return
+
+        labels = []
+        for idx, item in enumerate(reports):
+            pdf = item["pdf"]
+            when = datetime.fromtimestamp(item["modified"]).strftime("%Y-%m-%d %H:%M:%S")
+            prefix = "LATEST — " if idx == 0 else ""
+            label = f"{prefix}{when} — {pdf.name}"
+            labels.append(label)
+            self._bis_report_paths[label] = item
+
+        try:
+            self.bis_report_combo["values"] = labels
+        except (AttributeError, tk.TclError):
+            pass
+
+        current = self.bis_report_var.get()
+        if current not in self._bis_report_paths:
+            self.bis_report_var.set(labels[0])
+
+        self._update_selected_bis_report_detail()
+        self.refresh_bis_baseline_status()
+
+    def _selected_bis_report(self):
+        return self._bis_report_paths.get(self.bis_report_var.get())
+
+    def _update_selected_bis_report_detail(self):
+        item = self._selected_bis_report()
+        if not item:
+            self.bis_report_detail_var.set("No BIS report selected.")
+            try:
+                self.bis_report_combo.configure(style="History.TCombobox")
+            except (AttributeError, tk.TclError):
+                pass
+            return
+
+        try:
+            if self.bis_report_var.get().startswith("LATEST"):
+                self.bis_report_combo.configure(style="Latest.TCombobox")
+            else:
+                self.bis_report_combo.configure(style="History.TCombobox")
+        except (AttributeError, tk.TclError):
+            pass
+
+        pdf = item["pdf"]
+        txt = item.get("txt")
+        try:
+            when = datetime.fromtimestamp(item["modified"]).strftime("%A %d %B %Y, %H:%M:%S")
+        except Exception:
+            when = "Unknown time"
+
+        txt_status = txt.name if txt else "No matching Lock-Unlock TXT found"
+        self.bis_report_detail_var.set(
+            f"{when}  |  PDF: {pdf.name}  |  TXT: {txt_status}"
+        )
+
+    def open_selected_bis_report(self):
+        item = self._selected_bis_report()
+        if not item:
+            messagebox.showinfo(
+                "BIS Report",
+                "No generated BIS report is selected.\n\n"
+                "Generate a BIS report or click Refresh Reports."
+            )
+            return
+        try:
+            open_path(item["pdf"])
+        except Exception as exc:
+            messagebox.showerror("Could not open BIS Report", str(exc))
+
+    def open_selected_bis_text(self):
+        item = self._selected_bis_report()
+        if not item:
+            messagebox.showinfo(
+                "Lock-Unlock Report",
+                "No generated BIS report is selected."
+            )
+            return
+
+        txt = item.get("txt")
+        if not txt or not txt.exists():
+            messagebox.showinfo(
+                "Lock-Unlock Report",
+                "No matching Lock-Unlock TXT was found for the selected PDF."
+            )
+            return
+
+        try:
+            open_path(txt)
+        except Exception as exc:
+            messagebox.showerror("Could not open Lock-Unlock TXT", str(exc))
+
+    def _watch_for_new_bis_report(self, existing_pdfs: set[Path], attempts: int = 180):
+        """Refresh the picker when a newly generated report appears."""
+        if attempts <= 0:
+            return
+        try:
+            reports = self._bismirpg_reports_dir()
+            current = set(reports.glob("*.pdf")) if reports.exists() else set()
+            if current - existing_pdfs:
+                self.refresh_bis_report_picker()
+                self.status_var.set("New BIS report detected — report list refreshed")
+                return
+        except Exception:
+            return
+
+        self.after(
+            1000,
+            self._watch_for_new_bis_report,
+            existing_pdfs,
+            attempts - 1,
+        )
+
+    def _approved_bis_baseline_path(self):
+        bis_folder = self.module_folder("bismirpg")
+        if not bis_folder:
+            return None
+        return bis_folder / "approved_bis_state.json"
+
+    def refresh_bis_baseline_status(self):
+        approved = self._approved_bis_baseline_path()
+        if approved and approved.exists():
+            try:
+                when = datetime.fromtimestamp(approved.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                when = "unknown time"
+            self.bis_baseline_var.set(f"✓ Approved BIS baseline: {approved.name} — {when}")
+        else:
+            self.bis_baseline_var.set(
+                "⚠ Approved BIS baseline: NONE — changed-cell shading will not appear"
+            )
+
+    def approve_current_bis(self):
+        reports = self._bismirpg_reports_dir()
+        current = reports / "current_bis_state.json"
+        approved = self._approved_bis_baseline_path()
+
+        if not current.exists():
+            messagebox.showwarning(
+                "No BIS state to approve",
+                "Generate a BIS report first.\n\n"
+                "No current_bis_state.json was found in the Reports folder."
+            )
+            return
+        if approved is None:
+            return
+
+        if not messagebox.askyesno(
+            "Approve Current BIS",
+            "Make the current generated BIS the approved comparison baseline?\n\n"
+            "Future BIS reports will shade equipment cells that changed from this approved state.\n\n"
+            "Generating a report does NOT approve it automatically."
+        ):
+            return
+
+        try:
+            shutil.copy2(current, approved)
+            self.refresh_bis_baseline_status()
+            self.status_var.set("Current BIS approved as the comparison baseline")
+            messagebox.showinfo(
+                "BIS Baseline Approved",
+                f"Approved baseline saved to:\n{approved}\n\n"
+                "Future reports will compare against this state."
+            )
+        except Exception as exc:
+            messagebox.showerror("Could not approve BIS baseline", str(exc))
+
+    def _current_bis_run_id_from_work(self, work: Path):
+        """Best-effort current BIS run ID detection from extracted BIS_stats files."""
+        patterns = [
+            re.compile(r"(?i)RUN_ID\s*[:=]\s*(\d{8}_\d{6})"),
+            re.compile(r"(?i)run[_ -]?id\s*[:=]\s*(\d{8}_\d{6})"),
+            re.compile(r"(\d{8}_\d{6})"),
+        ]
+
+        candidates = []
+        for p in work.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.suffix.lower() not in {".txt", ".csv", ".json"}:
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            for pattern in patterns:
+                m = pattern.search(text)
+                if m:
+                    candidates.append(m.group(1))
+                    break
+
+        # Prefer the most common run ID across the handoff files.
+        if candidates:
+            from collections import Counter
+            return Counter(candidates).most_common(1)[0][0]
+        return None
+
+    def _approved_bis_run_id(self, baseline: Path | None):
+        if not baseline or not baseline.exists():
+            return None
+        try:
+            data = json.loads(baseline.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+        for key in ("run_id", "RUN_ID", "runId"):
+            value = data.get(key)
+            if value:
+                return str(value)
+
+        # Fallback: recursive string search for a timestamp-like run ID.
+        try:
+            raw = json.dumps(data)
+            m = re.search(r"(\d{8}_\d{6})", raw)
+            return m.group(1) if m else None
+        except Exception:
+            return None
 
     def run_bismirpg_report(self):
         bis_folder = self.module_folder("bismirpg")
@@ -1756,34 +2149,39 @@ class MapleToolbox(tk.Tk):
             )
             return
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_out = reports / f"MapleStory_BIS_Report_{stamp}.pdf"
-        txt_out = reports / f"MapleStory_BIS_Lock_Unlock_{stamp}.txt"
-        runner = work / "toolbox_bis_generator.py"
+        # BISMIRPG v1.0.0+ exposes a real command-line interface.
+        # Do not patch/edit the generator source. Pass BIS_stats.zip directly.
+        state_out = reports / "current_bis_state.json"
+        approved_baseline = self._approved_bis_baseline_path()
+        baseline_arg = approved_baseline if approved_baseline and approved_baseline.exists() else None
+        self.refresh_bis_baseline_status()
 
-        try:
-            source = generator.read_text(encoding="utf-8", errors="strict")
-            replacements = {
-                r"^EXP=.*$": f"EXP={str(export)!r}",
-                r"^STATUS=.*$": f"STATUS={str(status)!r}",
-                r"^CSV=.*$": f"CSV={str(review_csv)!r}",
-                r"^OUT=.*$": f"OUT={str(pdf_out)!r}",
-                r"^TXT=.*$": f"TXT={str(txt_out)!r}",
-            }
-            for pattern, value in replacements.items():
-                source, count = re.subn(
-                    pattern,
-                    lambda _m, replacement=value: replacement,
-                    source,
-                    count=1,
-                    flags=re.M,
-                )
-                if count != 1:
-                    raise RuntimeError(f"Could not configure generator setting: {pattern}")
-            runner.write_text(source, encoding="utf-8")
-        except Exception as exc:
-            messagebox.showerror("Could not prepare BIS generator", str(exc))
-            return
+        current_run_id = self._current_bis_run_id_from_work(work)
+        approved_run_id = self._approved_bis_run_id(baseline_arg)
+        allow_same_run = False
+
+        if baseline_arg is not None and current_run_id and approved_run_id and current_run_id == approved_run_id:
+            allow_same_run = messagebox.askyesno(
+                "Same BIS Run as Approved Baseline",
+                f"The current BIS run ({current_run_id}) is the same run as the approved baseline.\n\n"
+                "Normally there is nothing useful to compare because no new OCR/optimiser run has occurred.\n\n"
+                "For testing, Toolbox can deliberately generate a same-run 0-change report.\n\n"
+                "Generate the same-run comparison?"
+            )
+            if not allow_same_run:
+                self.status_var.set("BIS generation cancelled — current run matches approved baseline")
+                return
+
+        if baseline_arg is None:
+            proceed = messagebox.askyesno(
+                "No Approved BIS Baseline",
+                "There is no approved BIS baseline yet.\n\n"
+                "This report can still be generated, but changed equipment cells WILL NOT be shaded.\n\n"
+                "After generating it, use Approve Current BIS to establish the baseline for future comparisons.\n\n"
+                "Generate without a shading baseline?"
+            )
+            if not proceed:
+                return
 
         python_exe = self.root_path() / ".venv" / "Scripts" / "python.exe"
         if not python_exe.exists():
@@ -1812,8 +2210,12 @@ echo Maple Toolbox - BISMIRPG report generator
 echo.
 
 set "PY={cmd_escape(python_exe)}"
-set "RUNNER={cmd_escape(runner)}"
+set "GENERATOR={cmd_escape(generator)}"
+set "SOURCE={cmd_escape(source_zip)}"
 set "REPORTS={cmd_escape(reports)}"
+set "STATEOUT={cmd_escape(state_out)}"
+set "BASELINE={cmd_escape(baseline_arg) if baseline_arg else ""}"
+set "ALLOW_SAME_RUN={"1" if allow_same_run else "0"}"
 set "SHELLLOG={cmd_escape(work / "last_bismirpg_shell_output.txt")}"
 
 > "%SHELLLOG%" echo Maple Toolbox - BISMIRPG report generator
@@ -1835,7 +2237,21 @@ echo.
 echo Generating BIS report...
 >>"%SHELLLOG%" echo.
 >>"%SHELLLOG%" echo Generating BIS report...
-powershell.exe -NoProfile -Command "& '%PY%' '%RUNNER%' 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+if defined BASELINE (
+    echo Comparing against approved BIS baseline...
+    >>"%SHELLLOG%" echo Comparing against approved BIS baseline: %BASELINE%
+    if "%ALLOW_SAME_RUN%"=="1" (
+        echo Same-run baseline explicitly allowed by user for validation.
+        >>"%SHELLLOG%" echo Same-run baseline explicitly allowed by user for validation.
+        powershell.exe -NoProfile -Command "& '%PY%' '%GENERATOR%' '%SOURCE%' --out-dir '%REPORTS%' --baseline '%BASELINE%' --state-out '%STATEOUT%' --allow-same-run-baseline 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+    ) else (
+        powershell.exe -NoProfile -Command "& '%PY%' '%GENERATOR%' '%SOURCE%' --out-dir '%REPORTS%' --baseline '%BASELINE%' --state-out '%STATEOUT%' 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+    )
+) else (
+    echo No approved BIS baseline found - generating without change shading baseline.
+    >>"%SHELLLOG%" echo No approved BIS baseline found - generating without change shading baseline.
+    powershell.exe -NoProfile -Command "& '%PY%' '%GENERATOR%' '%SOURCE%' --out-dir '%REPORTS%' --state-out '%STATEOUT%' 2>&1 | Tee-Object -FilePath '%SHELLLOG%' -Append; exit $LASTEXITCODE"
+)
 if errorlevel 1 goto :failed
 
 echo.
@@ -1847,8 +2263,8 @@ echo Reports folder: %REPORTS%
 type "%SHELLLOG%" | clip
 echo.
 echo Output copied to clipboard.
-start "" "%REPORTS%"
 echo.
+echo Report picker will refresh in Maple Toolbox.
 echo This window will close automatically.
 for /l %%S in (8,-1,1) do (
     echo Closing in %%S...
@@ -1868,9 +2284,10 @@ echo.
 pause
 """
         try:
+            existing_pdfs = set(reports.glob("*.pdf"))
             launch_cmd.write_text(batch, encoding="utf-8")
             subprocess.Popen(
-                ["cmd.exe", "/k", str(launch_cmd)],
+                ["cmd.exe", "/c", str(launch_cmd)],
                 cwd=str(bis_folder),
                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
             )
@@ -1879,6 +2296,7 @@ pause
                 "shell_window",
             )
             self.status_var.set("BISMIRPG report generator opened")
+            self._watch_for_new_bis_report(existing_pdfs)
         except Exception as exc:
             messagebox.showerror("Could not start BISMIRPG", str(exc))
 
@@ -2582,8 +3000,8 @@ pause
             return None
 
         if module_key == "bismirpg":
-            # Current BISMIRPG v191 release has no VERSION file.
-            # Detect an installed generator and derive its baseline from local files.
+            # BISMIRPG releases may omit VERSION. Prefer public semantic versions
+            # from README/release notes (v1.0.0) over internal OCR markers (v195).
             if folder and (folder / "bis_report_generator.py").exists():
                 return (
                     local_version_from_folder(folder)
@@ -2635,6 +3053,10 @@ pause
                 text = f"{label}: {local} — up to date"
                 style = "Good.TLabel"
                 button_text = "Latest Release"
+            elif status == "development":
+                text = f"{label}: {local} — development build (latest public {remote})"
+                style = "Warn.TLabel"
+                button_text = "Latest Public Release"
             else:
                 text = f"{label}: no public downloadable release found"
                 style = "CardSubtle.TLabel"
@@ -2649,7 +3071,7 @@ pause
                 pady=(0 if row == 0 else 6, 0),
             )
 
-            if status in {"update", "not_installed", "current"}:
+            if status in {"update", "not_installed", "current", "development"}:
                 command = lambda key=module_key: self.open_module_release(key)
             else:
                 command = lambda key=module_key: self.open_module_github(key)
@@ -2689,6 +3111,7 @@ pause
             self.capture_installed_var.set("Installed: Not detected")
 
         self.status_var.set(f"Ready — {root}" if root.exists() else f"MapleOCR root not found — {root}")
+        self.refresh_bis_report_picker()
 
     def choose_capture_folder(self):
         self.select_module_folder("capture")
@@ -2813,6 +3236,15 @@ pause
                     not_installed += 1
                     status = "not_installed"
                     log_lines.append(f"{label}: not installed — public release {remote} available.")
+                elif (
+                    module_key == "toolbox"
+                    and "development" in str(local).lower()
+                    and version_tuple(local) > version_tuple(remote)
+                ):
+                    status = "development"
+                    log_lines.append(
+                        f"{label}: local development build {local}; latest public release is {remote}."
+                    )
                 elif version_tuple(local) < version_tuple(remote):
                     update_available += 1
                     status = "update"
